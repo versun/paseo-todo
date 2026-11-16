@@ -2,6 +2,7 @@
   "id": "todo",
   "name": "TODO",
   "description": "Task lists backed by plain TODO.md files, in a screen, a workspace tab, and a slash command",
+  "icon": "assets/icon.png",
   "media": ["assets/screenshot.png", "assets/workspace-panel.png"],
   "requirements": {
     "paseo": ">=0.15.4"
