@@ -12,7 +12,9 @@ import {
   type TodoItem,
 } from "../shared/todo";
 
-const GLOBAL_FILE = join(homedir(), "TODO.md");
+const HOME_DIR = homedir();
+const GLOBAL_FILE = join(HOME_DIR, "TODO.md");
+const PASEO_HOME = join(HOME_DIR, ".paseo");
 const CHECKBOX = /^(\s*[-*+]\s+\[)([ xX])(\]\s+(.*?))\r?$/;
 
 async function readText(path: string): Promise<string> {
@@ -33,19 +35,31 @@ function parseItems(text: string): TodoItem[] {
   });
 }
 
-async function resolvePath(paseo: PaseoApi, workspaceId: string | null): Promise<string> {
-  if (!workspaceId) return GLOBAL_FILE;
-  const { entries } = await paseo.workspaces.list();
-  const entry = entries.find((item) => item.id === workspaceId);
-  if (!entry?.workspaceDirectory) throw new Error("Workspace not found");
-  return join(entry.workspaceDirectory, "TODO.md");
+async function resolvePath(paseo: PaseoApi, projectId: string | null): Promise<string> {
+  if (!projectId) return GLOBAL_FILE;
+  const { projects } = await paseo.projects.list();
+  const project = projects.find((item) => item.projectId === projectId);
+  if (!project?.projectRootPath) throw new Error("Project not found");
+  return join(project.projectRootPath, "TODO.md");
 }
 
 export async function listTodosHandler(
   _input: RpcInput<typeof listTodos>,
   { paseo }: PluginHandlerContext,
 ) {
-  const { entries } = await paseo.workspaces.list();
+  const [{ projects }, { entries }] = await Promise.all([
+    paseo.projects.list(),
+    paseo.workspaces.list(),
+  ]);
+
+  const activeWorkspaceByProject = new Map<string, string>();
+  for (const entry of entries) {
+    if (entry.archivingAt || entry.internal || entry.background) continue;
+    if (!activeWorkspaceByProject.has(entry.projectId)) {
+      activeWorkspaceByProject.set(entry.projectId, entry.id);
+    }
+  }
+
   const cache = new Map<string, Promise<TodoItem[]>>();
   const loadItems = (path: string) => {
     let pending = cache.get(path);
@@ -56,23 +70,31 @@ export async function listTodosHandler(
     return pending;
   };
 
-  const active = entries.filter(
-    (entry) =>
-      Boolean(entry.workspaceDirectory) &&
-      !entry.archivingAt &&
-      !entry.internal &&
-      !entry.background,
-  );
+  const validProjects = projects
+    .filter(
+      (project) =>
+        Boolean(project.projectRootPath) &&
+        project.projectRootPath !== HOME_DIR &&
+        project.projectRootPath !== PASEO_HOME,
+    )
+    .sort((a, b) => {
+      const aActive = activeWorkspaceByProject.has(a.projectId) ? 0 : 1;
+      const bActive = activeWorkspaceByProject.has(b.projectId) ? 0 : 1;
+      if (aActive !== bActive) return aActive - bActive;
+      const aLabel = a.projectCustomName ?? a.projectDisplayName;
+      const bLabel = b.projectCustomName ?? b.projectDisplayName;
+      return aLabel.localeCompare(bLabel);
+    });
 
-  const [globalItems, workspaces] = await Promise.all([
+  const [globalItems, projectFiles] = await Promise.all([
     loadItems(GLOBAL_FILE),
     Promise.all(
-      active.map(async (entry) => {
-        const path = join(entry.workspaceDirectory!, "TODO.md");
+      validProjects.map(async (project) => {
+        const path = join(project.projectRootPath, "TODO.md");
         return {
-          workspaceId: entry.id,
-          label: entry.title ?? entry.name,
-          project: entry.projectDisplayName || null,
+          projectId: project.projectId,
+          workspaceId: activeWorkspaceByProject.get(project.projectId) ?? null,
+          label: project.projectCustomName ?? project.projectDisplayName,
           path,
           items: await loadItems(path),
         };
@@ -82,21 +104,21 @@ export async function listTodosHandler(
 
   return {
     global: {
+      projectId: null,
       workspaceId: null,
-      label: "Inbox",
-      project: null,
+      label: "Global",
       path: GLOBAL_FILE,
       items: globalItems,
     },
-    workspaces,
+    projects: projectFiles,
   };
 }
 
 export async function addTodoHandler(
-  { workspaceId, text }: RpcInput<typeof addTodo>,
+  { projectId, text }: RpcInput<typeof addTodo>,
   { paseo }: PluginHandlerContext,
 ) {
-  const path = await resolvePath(paseo, workspaceId);
+  const path = await resolvePath(paseo, projectId);
   const existing = await readText(path);
   const separator = existing === "" || existing.endsWith("\n") ? "" : "\n";
   await writeFile(path, `${existing}${separator}- [ ] ${text}\n`, "utf8");
@@ -104,10 +126,10 @@ export async function addTodoHandler(
 }
 
 export async function toggleTodoHandler(
-  { workspaceId, index }: RpcInput<typeof toggleTodo>,
+  { projectId, index }: RpcInput<typeof toggleTodo>,
   { paseo }: PluginHandlerContext,
 ) {
-  const path = await resolvePath(paseo, workspaceId);
+  const path = await resolvePath(paseo, projectId);
   let seen = 0;
   const next = (await readText(path))
     .split(/\r?\n/)
@@ -122,10 +144,10 @@ export async function toggleTodoHandler(
 }
 
 export async function removeTodoHandler(
-  { workspaceId, index }: RpcInput<typeof removeTodo>,
+  { projectId, index }: RpcInput<typeof removeTodo>,
   { paseo }: PluginHandlerContext,
 ) {
-  const path = await resolvePath(paseo, workspaceId);
+  const path = await resolvePath(paseo, projectId);
   const existing = await readText(path);
   if (!existing) return { ok: true };
   let seen = 0;

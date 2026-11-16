@@ -9,9 +9,9 @@ const todoItemSchema = z.object({
 
 const todoFileSchema = z.object({
   /** `null` for the global ~/TODO.md. */
+  projectId: z.string().nullable(),
   workspaceId: z.string().nullable(),
   label: z.string(),
-  project: z.string().nullable(),
   path: z.string(),
   items: z.array(todoItemSchema),
 });
@@ -25,14 +25,14 @@ export const listTodos = defineRpc({
   input: z.object({}),
   output: z.object({
     global: todoFileSchema,
-    workspaces: z.array(todoFileSchema),
+    projects: z.array(todoFileSchema),
   }),
 });
 
 export const addTodo = defineRpc({
   name: "todo.add",
   input: z.object({
-    workspaceId: z.string().nullable(),
+    projectId: z.string().nullable(),
     text: z.string().trim().min(1),
   }),
   output: z.object({ ok: z.boolean() }),
@@ -41,7 +41,7 @@ export const addTodo = defineRpc({
 export const toggleTodo = defineRpc({
   name: "todo.toggle",
   input: z.object({
-    workspaceId: z.string().nullable(),
+    projectId: z.string().nullable(),
     index: z.number().int().nonnegative(),
   }),
   output: z.object({ ok: z.boolean() }),
@@ -50,7 +50,7 @@ export const toggleTodo = defineRpc({
 export const removeTodo = defineRpc({
   name: "todo.remove",
   input: z.object({
-    workspaceId: z.string().nullable(),
+    projectId: z.string().nullable(),
     /** Omit `index` to clear all completed items in the target file. */
     index: z.number().int().nonnegative().optional(),
   }),

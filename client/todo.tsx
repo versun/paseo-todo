@@ -21,7 +21,7 @@ import {
 const QUERY_KEY = ["todos"];
 
 type TodoTheme = PluginScreenProps["theme"];
-type FilterMode = "all" | "personal" | "workspaces";
+type FilterMode = "all" | "global" | "projects";
 
 function messageOf(error: unknown) {
   return error instanceof Error ? error.message : String(error);
@@ -33,20 +33,20 @@ function reindex(items: TodoItem[]): TodoItem[] {
 
 function updateMatchingFiles(
   data: TodoListData | undefined,
-  workspaceId: string | null,
+  projectId: string | null,
   updater: (items: TodoItem[]) => TodoItem[],
 ): TodoListData | undefined {
   if (!data) return data;
   const targetPath =
-    workspaceId === null
+    projectId === null
       ? data.global.path
-      : data.workspaces.find((item) => item.workspaceId === workspaceId)?.path;
+      : data.projects.find((item) => item.projectId === projectId)?.path;
   if (!targetPath) return data;
   const apply = (file: TodoFile): TodoFile =>
     file.path === targetPath ? { ...file, items: reindex(updater(file.items)) } : file;
   return {
     global: apply(data.global),
-    workspaces: data.workspaces.map(apply),
+    projects: data.projects.map(apply),
   };
 }
 
@@ -67,10 +67,10 @@ export function useTodos() {
 
   const addMutation = useMutation({
     mutationFn: addRpc,
-    onMutate: async ({ workspaceId, text }) => {
+    onMutate: async ({ projectId, text }) => {
       await queryClient.cancelQueries({ queryKey: QUERY_KEY });
       queryClient.setQueryData<TodoListData>(QUERY_KEY, (prev) =>
-        updateMatchingFiles(prev, workspaceId, (items) => [
+        updateMatchingFiles(prev, projectId, (items) => [
           ...items,
           { index: items.length, text, done: false },
         ]),
@@ -81,10 +81,10 @@ export function useTodos() {
 
   const toggleMutation = useMutation({
     mutationFn: toggleRpc,
-    onMutate: async ({ workspaceId, index }) => {
+    onMutate: async ({ projectId, index }) => {
       await queryClient.cancelQueries({ queryKey: QUERY_KEY });
       queryClient.setQueryData<TodoListData>(QUERY_KEY, (prev) =>
-        updateMatchingFiles(prev, workspaceId, (items) =>
+        updateMatchingFiles(prev, projectId, (items) =>
           items.map((item) => (item.index === index ? { ...item, done: !item.done } : item)),
         ),
       );
@@ -94,10 +94,10 @@ export function useTodos() {
 
   const removeMutation = useMutation({
     mutationFn: removeRpc,
-    onMutate: async ({ workspaceId, index }) => {
+    onMutate: async ({ projectId, index }) => {
       await queryClient.cancelQueries({ queryKey: QUERY_KEY });
       queryClient.setQueryData<TodoListData>(QUERY_KEY, (prev) =>
-        updateMatchingFiles(prev, workspaceId, (items) =>
+        updateMatchingFiles(prev, projectId, (items) =>
           items.filter((item) => (index !== undefined ? item.index !== index : !item.done)),
         ),
       );
@@ -108,28 +108,21 @@ export function useTodos() {
   return {
     data: query.data,
     error: query.error,
-    add: (workspaceId: string | null, text: string) =>
-      addMutation.mutateAsync({ workspaceId, text }),
-    toggle: (workspaceId: string | null, index: number) =>
-      toggleMutation.mutateAsync({ workspaceId, index }),
-    remove: (workspaceId: string | null, index?: number) =>
-      removeMutation.mutateAsync({ workspaceId, index }),
+    add: (projectId: string | null, text: string) =>
+      addMutation.mutateAsync({ projectId, text }),
+    toggle: (projectId: string | null, index: number) =>
+      toggleMutation.mutateAsync({ projectId, index }),
+    remove: (projectId: string | null, index?: number) =>
+      removeMutation.mutateAsync({ projectId, index }),
   };
 }
 
 type TodoActions = Pick<ReturnType<typeof useTodos>, "add" | "toggle" | "remove">;
 
-function deduplicateFiles(data: TodoListData): TodoFile[] {
-  return data.workspaces.filter(
-    (file, index, all) =>
-      file.path !== data.global.path && all.findIndex((item) => item.path === file.path) === index,
-  );
-}
-
 export function TodoSidebarItem({ theme, currentScreen, openScreen }: PluginSidebarItemProps) {
   const { data } = useTodos();
   const openCount = data
-    ? [data.global, ...deduplicateFiles(data)].reduce(
+    ? [data.global, ...data.projects].reduce(
         (sum, file) => sum + file.items.filter((item) => !item.done).length,
         0,
       )
@@ -234,9 +227,6 @@ function TodoSection({
   compactHeader?: boolean;
   onOpenWorkspace?: () => void;
 }) {
-  const [draft, setDraft] = useState("");
-  const [focused, setFocused] = useState(false);
-  const [busy, setBusy] = useState(false);
   const [showDone, setShowDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -244,29 +234,12 @@ function TodoSection({
   const doneItems = file.items.filter((item) => item.done);
   const totalCount = file.items.length;
   const progress = totalCount > 0 ? doneItems.length / totalCount : 0;
-  const canSubmit = draft.trim() !== "" && !busy;
-
-  const submit = async () => {
-    const text = draft.trim();
-    if (!text || busy) return;
-    setBusy(true);
-    setDraft("");
-    try {
-      await actions.add(file.workspaceId, text);
-      setError(null);
-    } catch (cause) {
-      setDraft(text);
-      setError(messageOf(cause));
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const runAction = (promise: Promise<unknown>) => {
     promise.then(() => setError(null)).catch((cause) => setError(messageOf(cause)));
   };
 
-  const isGlobal = file.workspaceId === null;
+  const isGlobal = file.projectId === null;
   const displayPath = isGlobal ? "~/TODO.md" : file.path;
 
   return (
@@ -315,21 +288,9 @@ function TodoSection({
             />
           </View>
           <View style={styles.sectionTitleBlock}>
-            <View style={styles.sectionTitleRow}>
-              <Text style={[styles.sectionTitle, { color: theme.colors.foreground }]} numberOfLines={1}>
-                {isGlobal ? "Personal" : file.label}
-              </Text>
-              {file.project ? (
-                <View style={[styles.projectTag, { backgroundColor: theme.colors.surface2 }]}>
-                  <Text
-                    style={[styles.projectTagText, { color: theme.colors.foregroundMuted }]}
-                    numberOfLines={1}
-                  >
-                    {file.project}
-                  </Text>
-                </View>
-              ) : null}
-            </View>
+            <Text style={[styles.sectionTitle, { color: theme.colors.foreground }]} numberOfLines={1}>
+              {isGlobal ? "Global" : file.label}
+            </Text>
             <Text
               style={[styles.sectionPath, { color: theme.colors.foregroundMuted }]}
               numberOfLines={1}
@@ -351,7 +312,7 @@ function TodoSection({
             {onOpenWorkspace ? (
               <Pressable
                 accessibilityRole="button"
-                accessibilityLabel={`Open workspace ${file.label}`}
+                accessibilityLabel={`Open ${file.label}`}
                 hitSlop={6}
                 onPress={onOpenWorkspace}
                 style={[styles.openWorkspaceButton, { borderColor: theme.colors.border }]}
@@ -363,21 +324,214 @@ function TodoSection({
         </View>
       )}
 
-      <View
-        style={[
-          styles.card,
-          {
-            backgroundColor: theme.colors.surface1,
-            borderColor: focused ? theme.colors.accent : theme.colors.border,
-          },
-        ]}
-      >
+      {totalCount === 0 ? (
         <View
           style={[
-            styles.composerRow,
-            (openItems.length > 0 || doneItems.length > 0) && {
-              borderBottomWidth: StyleSheet.hairlineWidth,
-              borderBottomColor: theme.colors.border,
+            styles.emptyCard,
+            { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
+          ]}
+        >
+          <Text style={[styles.emptyText, { color: theme.colors.foregroundMuted }]}>
+            No tasks yet — add one below.
+          </Text>
+        </View>
+      ) : (
+        <View
+          style={[
+            styles.card,
+            { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
+          ]}
+        >
+          {openItems.map((item, idx) => (
+            <TodoRow
+              key={item.index}
+              item={item}
+              last={idx === openItems.length - 1 && doneItems.length === 0}
+              theme={theme}
+              onToggle={() => runAction(actions.toggle(file.projectId, item.index))}
+              onRemove={() => runAction(actions.remove(file.projectId, item.index))}
+            />
+          ))}
+
+          {doneItems.length > 0 ? (
+            <View>
+              <View
+                style={[
+                  styles.completedBar,
+                  { backgroundColor: theme.colors.surface0 },
+                  showDone && {
+                    borderBottomWidth: StyleSheet.hairlineWidth,
+                    borderBottomColor: theme.colors.border,
+                  },
+                ]}
+              >
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={showDone ? "Hide completed tasks" : "Show completed tasks"}
+                  onPress={() => setShowDone((prev) => !prev)}
+                  style={styles.completedToggle}
+                >
+                  <Icon
+                    name={showDone ? "ChevronDown" : "ChevronRight"}
+                    size={13}
+                    color={theme.colors.foregroundMuted}
+                  />
+                  <Text style={[styles.completedLabel, { color: theme.colors.foregroundMuted }]}>
+                    Completed · {doneItems.length}
+                  </Text>
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Clear completed tasks"
+                  hitSlop={6}
+                  onPress={() => runAction(actions.remove(file.projectId))}
+                >
+                  <Text style={[styles.clearText, { color: theme.colors.foregroundMuted }]}>
+                    Clear
+                  </Text>
+                </Pressable>
+              </View>
+              {showDone
+                ? doneItems.map((item, idx) => (
+                    <TodoRow
+                      key={item.index}
+                      item={item}
+                      last={idx === doneItems.length - 1}
+                      theme={theme}
+                      onToggle={() => runAction(actions.toggle(file.projectId, item.index))}
+                      onRemove={() => runAction(actions.remove(file.projectId, item.index))}
+                    />
+                  ))
+                : null}
+            </View>
+          ) : null}
+        </View>
+      )}
+
+      {error ? (
+        <Text style={[styles.error, { color: theme.colors.statusDanger }]}>{error}</Text>
+      ) : null}
+    </View>
+  );
+}
+
+interface ComposerTarget {
+  projectId: string | null;
+  label: string;
+}
+
+function TodoBottomComposer({
+  theme,
+  compact,
+  projectId,
+  targetLabel,
+  targets,
+  onSelectProject,
+  onAdd,
+}: {
+  theme: TodoTheme;
+  compact?: boolean;
+  projectId: string | null;
+  targetLabel: string;
+  targets?: ComposerTarget[];
+  onSelectProject?: (projectId: string | null) => void;
+  onAdd: (projectId: string | null, text: string) => Promise<unknown>;
+}) {
+  const [draft, setDraft] = useState("");
+  const [focused, setFocused] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const canSubmit = draft.trim() !== "" && !busy;
+
+  const submit = async () => {
+    const text = draft.trim();
+    if (!text || busy) return;
+    setBusy(true);
+    setDraft("");
+    try {
+      await onAdd(projectId, text);
+      setError(null);
+    } catch (cause) {
+      setDraft(text);
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <View
+      style={[
+        styles.bottomDock,
+        {
+          backgroundColor: theme.colors.surface0,
+          borderTopColor: theme.colors.border,
+          paddingHorizontal: compact ? 12 : 24,
+          paddingVertical: compact ? 10 : 14,
+        },
+      ]}
+    >
+      <View style={styles.bottomDockInner}>
+        {targets && onSelectProject ? (
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+            contentContainerStyle={styles.targetSelectorRow}
+          >
+            {targets.map((target) => {
+              const selected = target.projectId === projectId;
+              const isGlobal = target.projectId === null;
+              return (
+                <Pressable
+                  key={target.projectId ?? "__global__"}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected }}
+                  accessibilityLabel={`Target ${target.label}`}
+                  onPress={() => onSelectProject(target.projectId)}
+                  style={[
+                    styles.targetChip,
+                    {
+                      backgroundColor: selected
+                        ? theme.colors.accent
+                        : theme.colors.surface1,
+                      borderColor: selected ? theme.colors.accent : theme.colors.border,
+                    },
+                  ]}
+                >
+                  <Icon
+                    name={isGlobal ? "Inbox" : "FolderGit2"}
+                    size={12}
+                    color={
+                      selected ? theme.colors.accentForeground : theme.colors.foregroundMuted
+                    }
+                  />
+                  <Text
+                    style={[
+                      styles.targetChipText,
+                      {
+                        color: selected
+                          ? theme.colors.accentForeground
+                          : theme.colors.foreground,
+                      },
+                    ]}
+                    numberOfLines={1}
+                  >
+                    {target.label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+        ) : null}
+
+        <View
+          style={[
+            styles.composerBox,
+            {
+              backgroundColor: theme.colors.surface1,
+              borderColor: focused ? theme.colors.accent : theme.colors.border,
             },
           ]}
         >
@@ -401,99 +555,35 @@ function TodoSection({
             blurOnSubmit={false}
             editable={!busy}
             returnKeyType="done"
-            placeholder={isGlobal ? "New personal to-do…" : "New to-do…"}
+            placeholder={`Add to ${targetLabel}…`}
             placeholderTextColor={theme.colors.foregroundMuted}
-            accessibilityLabel={`Add a todo to ${file.label}`}
+            accessibilityLabel={`Add a todo to ${targetLabel}`}
             style={[styles.composerInput, { color: theme.colors.foreground }]}
           />
-          {canSubmit ? (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Add todo"
-              onPress={submit}
-              style={[styles.submitPill, { backgroundColor: theme.colors.accent }]}
-            >
-              <Icon name="CornerDownLeft" size={12} color={theme.colors.accentForeground} />
-            </Pressable>
-          ) : null}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Add todo"
+            disabled={!canSubmit}
+            onPress={submit}
+            style={[
+              styles.submitPill,
+              {
+                backgroundColor: canSubmit ? theme.colors.accent : theme.colors.surface2,
+              },
+            ]}
+          >
+            <Icon
+              name="CornerDownLeft"
+              size={12}
+              color={canSubmit ? theme.colors.accentForeground : theme.colors.foregroundMuted}
+            />
+          </Pressable>
         </View>
 
-        {openItems.length === 0 && doneItems.length === 0 ? (
-          <View style={styles.emptyState}>
-            <Text style={[styles.emptyText, { color: theme.colors.foregroundMuted }]}>
-              No tasks yet — type above to add one.
-            </Text>
-          </View>
-        ) : (
-          openItems.map((item, idx) => (
-            <TodoRow
-              key={item.index}
-              item={item}
-              last={idx === openItems.length - 1 && doneItems.length === 0}
-              theme={theme}
-              onToggle={() => runAction(actions.toggle(file.workspaceId, item.index))}
-              onRemove={() => runAction(actions.remove(file.workspaceId, item.index))}
-            />
-          ))
-        )}
-
-        {doneItems.length > 0 ? (
-          <View style={styles.completedContainer}>
-            <View
-              style={[
-                styles.completedBar,
-                { backgroundColor: theme.colors.surface0 },
-                showDone && {
-                  borderBottomWidth: StyleSheet.hairlineWidth,
-                  borderBottomColor: theme.colors.border,
-                },
-              ]}
-            >
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel={showDone ? "Hide completed tasks" : "Show completed tasks"}
-                onPress={() => setShowDone((prev) => !prev)}
-                style={styles.completedToggle}
-              >
-                <Icon
-                  name={showDone ? "ChevronDown" : "ChevronRight"}
-                  size={13}
-                  color={theme.colors.foregroundMuted}
-                />
-                <Text style={[styles.completedLabel, { color: theme.colors.foregroundMuted }]}>
-                  Completed · {doneItems.length}
-                </Text>
-              </Pressable>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Clear completed tasks"
-                hitSlop={6}
-                onPress={() => runAction(actions.remove(file.workspaceId))}
-              >
-                <Text style={[styles.clearText, { color: theme.colors.foregroundMuted }]}>
-                  Clear
-                </Text>
-              </Pressable>
-            </View>
-            {showDone
-              ? doneItems.map((item, idx) => (
-                  <TodoRow
-                    key={item.index}
-                    item={item}
-                    last={idx === doneItems.length - 1}
-                    theme={theme}
-                    onToggle={() => runAction(actions.toggle(file.workspaceId, item.index))}
-                    onRemove={() => runAction(actions.remove(file.workspaceId, item.index))}
-                  />
-                ))
-              : null}
-          </View>
+        {error ? (
+          <Text style={[styles.error, { color: theme.colors.statusDanger }]}>{error}</Text>
         ) : null}
       </View>
-
-      {error ? (
-        <Text style={[styles.error, { color: theme.colors.statusDanger }]}>{error}</Text>
-      ) : null}
     </View>
   );
 }
@@ -501,15 +591,22 @@ function TodoSection({
 export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
   const todos = useTodos();
   const [filter, setFilter] = useState<FilterMode>("all");
+  const [targetProjectId, setTargetProjectId] = useState<string | null>(null);
   const data = todos.data;
 
-  const workspaceFiles = data ? deduplicateFiles(data) : [];
-  const allFiles = data ? [data.global, ...workspaceFiles] : [];
-  const totalOpen = allFiles.reduce(
+  const allProjects = data ? data.projects : [];
+  const projectsWithTodos = allProjects.filter((file) => file.items.length > 0);
+  const showGlobalSection = Boolean(
+    data && filter !== "projects" && data.global.items.length > 0,
+  );
+  const visibleProjects = filter === "global" ? [] : projectsWithTodos;
+
+  const countedFiles = data ? [data.global, ...projectsWithTodos] : [];
+  const totalOpen = countedFiles.reduce(
     (sum, file) => sum + file.items.filter((item) => !item.done).length,
     0,
   );
-  const totalDone = allFiles.reduce(
+  const totalDone = countedFiles.reduce(
     (sum, file) => sum + file.items.filter((item) => item.done).length,
     0,
   );
@@ -519,152 +616,196 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
   const filters: { id: FilterMode; label: string; count: number }[] = [
     { id: "all", label: "All", count: totalOpen },
     {
-      id: "personal",
-      label: "Personal",
+      id: "global",
+      label: "Global",
       count: data ? data.global.items.filter((item) => !item.done).length : 0,
     },
     {
-      id: "workspaces",
-      label: "Workspaces",
-      count: workspaceFiles.reduce(
+      id: "projects",
+      label: "Projects",
+      count: projectsWithTodos.reduce(
         (sum, file) => sum + file.items.filter((item) => !item.done).length,
         0,
       ),
     },
   ];
 
+  const composerTargets: ComposerTarget[] = [
+    { projectId: null, label: "Global" },
+    ...allProjects.map((file) => ({
+      projectId: file.projectId,
+      label: file.label,
+    })),
+  ];
+
+  const effectiveProjectId = composerTargets.some(
+    (item) => item.projectId === targetProjectId,
+  )
+    ? targetProjectId
+    : null;
+  const activeTargetLabel =
+    composerTargets.find((item) => item.projectId === effectiveProjectId)?.label ?? "Global";
+
   return (
-    <ScrollView
-      style={{ flex: 1, backgroundColor: theme.colors.surface0 }}
-      contentContainerStyle={{
-        padding: layout.compact ? 16 : 28,
-        gap: 22,
-        width: "100%",
-        maxWidth: 720,
-        alignSelf: "center",
-      }}
-      keyboardShouldPersistTaps="handled"
-    >
-      <View style={styles.screenHeader}>
-        <View style={styles.screenTopRow}>
-          <View style={[styles.filterBar, { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border }]}>
-            {filters.map((tab) => {
-              const active = filter === tab.id;
-              return (
-                <Pressable
-                  key={tab.id}
-                  accessibilityRole="tab"
-                  accessibilityState={{ selected: active }}
-                  onPress={() => setFilter(tab.id)}
-                  style={[
-                    styles.filterTab,
-                    active && { backgroundColor: theme.colors.surface2 },
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.filterTabText,
-                      {
-                        color: active ? theme.colors.foreground : theme.colors.foregroundMuted,
-                        fontWeight: active ? "600" : "500",
-                      },
-                    ]}
-                  >
-                    {tab.label}
-                  </Text>
-                  {tab.count > 0 ? (
-                    <Text
-                      style={[
-                        styles.filterTabCount,
-                        { color: active ? theme.colors.accent : theme.colors.foregroundMuted },
-                      ]}
-                    >
-                      {tab.count}
-                    </Text>
-                  ) : null}
-                </Pressable>
-              );
-            })}
-          </View>
-          {data ? (
-            <Text style={[styles.summaryText, { color: theme.colors.foregroundMuted }]}>
-              {totalOpen} open · {totalDone} done
-            </Text>
-          ) : null}
-        </View>
-        {totalItems > 0 ? (
-          <View style={[styles.progressTrack, { backgroundColor: theme.colors.surface2 }]}>
+    <View style={{ flex: 1, backgroundColor: theme.colors.surface0 }}>
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={{
+          padding: layout.compact ? 16 : 28,
+          gap: 22,
+          width: "100%",
+          maxWidth: 720,
+          alignSelf: "center",
+        }}
+        keyboardShouldPersistTaps="handled"
+      >
+        <View style={styles.screenHeader}>
+          <View style={styles.screenTopRow}>
             <View
               style={[
-                styles.progressFill,
-                {
-                  width: `${Math.round(totalProgress * 100)}%`,
-                  backgroundColor:
-                    totalProgress === 1 ? theme.colors.statusSuccess : theme.colors.accent,
-                },
+                styles.filterBar,
+                { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
               ]}
-            />
+            >
+              {filters.map((tab) => {
+                const active = filter === tab.id;
+                return (
+                  <Pressable
+                    key={tab.id}
+                    accessibilityRole="tab"
+                    accessibilityState={{ selected: active }}
+                    onPress={() => setFilter(tab.id)}
+                    style={[
+                      styles.filterTab,
+                      active && { backgroundColor: theme.colors.surface2 },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.filterTabText,
+                        {
+                          color: active ? theme.colors.foreground : theme.colors.foregroundMuted,
+                          fontWeight: active ? "600" : "500",
+                        },
+                      ]}
+                    >
+                      {tab.label}
+                    </Text>
+                    {tab.count > 0 ? (
+                      <Text
+                        style={[
+                          styles.filterTabCount,
+                          { color: active ? theme.colors.accent : theme.colors.foregroundMuted },
+                        ]}
+                      >
+                        {tab.count}
+                      </Text>
+                    ) : null}
+                  </Pressable>
+                );
+              })}
+            </View>
+            {data ? (
+              <Text style={[styles.summaryText, { color: theme.colors.foregroundMuted }]}>
+                {totalOpen} open · {totalDone} done
+              </Text>
+            ) : null}
           </View>
+          {totalItems > 0 ? (
+            <View style={[styles.progressTrack, { backgroundColor: theme.colors.surface2 }]}>
+              <View
+                style={[
+                  styles.progressFill,
+                  {
+                    width: `${Math.round(totalProgress * 100)}%`,
+                    backgroundColor:
+                      totalProgress === 1 ? theme.colors.statusSuccess : theme.colors.accent,
+                  },
+                ]}
+              />
+            </View>
+          ) : null}
+        </View>
+
+        {todos.error ? (
+          <Text style={{ color: theme.colors.statusDanger }}>{todos.error.message}</Text>
         ) : null}
-      </View>
 
-      {todos.error ? (
-        <Text style={{ color: theme.colors.statusDanger }}>{todos.error.message}</Text>
-      ) : null}
+        {data ? (
+          <>
+            {showGlobalSection ? (
+              <TodoSection file={data.global} theme={theme} actions={todos} />
+            ) : null}
+            {visibleProjects.map((file) => (
+              <TodoSection
+                key={file.projectId}
+                file={file}
+                theme={theme}
+                actions={todos}
+                onOpenWorkspace={
+                  file.workspaceId && navigation?.openWorkspace
+                    ? () => navigation.openWorkspace({ workspaceId: file.workspaceId! })
+                    : undefined
+                }
+              />
+            ))}
+            {!showGlobalSection && visibleProjects.length === 0 ? (
+              <View
+                style={[
+                  styles.emptyCard,
+                  { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
+                ]}
+              >
+                <Text style={[styles.emptyText, { color: theme.colors.foregroundMuted }]}>
+                  No todos yet — choose a project below to add one.
+                </Text>
+              </View>
+            ) : null}
+          </>
+        ) : (
+          <Text style={{ color: theme.colors.foregroundMuted }}>Loading…</Text>
+        )}
+      </ScrollView>
 
-      {data ? (
-        <>
-          {filter !== "workspaces" ? (
-            <TodoSection file={data.global} theme={theme} actions={todos} />
-          ) : null}
-          {filter !== "personal"
-            ? workspaceFiles.map((file) => (
-                <TodoSection
-                  key={file.workspaceId}
-                  file={file}
-                  theme={theme}
-                  actions={todos}
-                  onOpenWorkspace={
-                    file.workspaceId && navigation?.openWorkspace
-                      ? () => navigation.openWorkspace({ workspaceId: file.workspaceId! })
-                      : undefined
-                  }
-                />
-              ))
-            : null}
-          {filter === "workspaces" && workspaceFiles.length === 0 ? (
-            <Text style={[styles.emptyText, { color: theme.colors.foregroundMuted }]}>
-              No active workspace TODO lists.
-            </Text>
-          ) : null}
-        </>
-      ) : (
-        <Text style={{ color: theme.colors.foregroundMuted }}>Loading…</Text>
-      )}
-    </ScrollView>
+      <TodoBottomComposer
+        theme={theme}
+        compact={layout.compact}
+        projectId={effectiveProjectId}
+        targetLabel={activeTargetLabel}
+        targets={composerTargets}
+        onSelectProject={setTargetProjectId}
+        onAdd={todos.add}
+      />
+    </View>
   );
 }
 
 export function WorkspaceTodosPanel({ theme, workspaceId }: PluginWorkspacePanelProps) {
   const todos = useTodos();
   const snapshot = useWorkspace(workspaceId, (workspace) => ({
-    name: workspace.title ?? workspace.name,
-    project: workspace.projectDisplayName,
-    directory: workspace.directory,
+    projectId: workspace.projectId,
+    projectName: workspace.projectDisplayName,
+    projectRootPath: workspace.projectRootPath,
   }));
 
-  const matched = todos.data?.workspaces.find((item) => item.workspaceId === workspaceId);
+  const data = todos.data;
+  const matchedProject = data?.projects.find((item) => item.projectId === snapshot?.projectId);
+  const isGlobalRoot =
+    Boolean(snapshot && data && `${snapshot.projectRootPath}/TODO.md` === data.global.path);
+
   const file: TodoFile | null =
-    matched ??
-    (todos.data && snapshot
-      ? {
-          workspaceId,
-          label: snapshot.name,
-          project: snapshot.project,
-          path: `${snapshot.directory}/TODO.md`,
-          items: [],
-        }
-      : null);
+    matchedProject ??
+    (isGlobalRoot && data
+      ? data.global
+      : data && snapshot
+        ? {
+            projectId: snapshot.projectId,
+            workspaceId,
+            label: snapshot.projectName,
+            path: `${snapshot.projectRootPath}/TODO.md`,
+            items: [],
+          }
+        : null);
 
   if (!file) {
     return (
@@ -677,13 +818,22 @@ export function WorkspaceTodosPanel({ theme, workspaceId }: PluginWorkspacePanel
   }
 
   return (
-    <ScrollView
-      style={{ flex: 1, backgroundColor: theme.colors.surface0 }}
-      contentContainerStyle={{ padding: 12, gap: 12 }}
-      keyboardShouldPersistTaps="handled"
-    >
-      <TodoSection file={file} theme={theme} actions={todos} compactHeader />
-    </ScrollView>
+    <View style={{ flex: 1, backgroundColor: theme.colors.surface0 }}>
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={{ padding: 12, gap: 12 }}
+        keyboardShouldPersistTaps="handled"
+      >
+        <TodoSection file={file} theme={theme} actions={todos} compactHeader />
+      </ScrollView>
+      <TodoBottomComposer
+        theme={theme}
+        compact
+        projectId={file.projectId}
+        targetLabel={file.label}
+        onAdd={todos.add}
+      />
+    </View>
   );
 }
 
@@ -782,25 +932,10 @@ const styles = StyleSheet.create({
     flex: 1,
     gap: 1,
   },
-  sectionTitleRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-  },
   sectionTitle: {
     fontSize: 14,
     fontWeight: "600",
     flexShrink: 1,
-  },
-  projectTag: {
-    paddingHorizontal: 6,
-    paddingVertical: 1.5,
-    borderRadius: 5,
-    maxWidth: 140,
-  },
-  projectTagText: {
-    fontSize: 10.5,
-    fontWeight: "500",
   },
   sectionPath: {
     fontSize: 11,
@@ -835,34 +970,12 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     overflow: "hidden",
   },
-  composerRow: {
-    flexDirection: "row",
+  emptyCard: {
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 14,
+    paddingVertical: 16,
     alignItems: "center",
-    gap: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
-  },
-  plusSlot: {
-    width: 18,
-    height: 18,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  composerInput: {
-    flex: 1,
-    fontSize: 13.5,
-    paddingVertical: 2,
-  },
-  submitPill: {
-    width: 24,
-    height: 22,
-    borderRadius: 6,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  emptyState: {
-    paddingHorizontal: 12,
-    paddingVertical: 12,
   },
   emptyText: {
     fontSize: 12.5,
@@ -901,10 +1014,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     opacity: 0.7,
   },
-  completedContainer: {
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "transparent",
-  },
   completedBar: {
     flexDirection: "row",
     alignItems: "center",
@@ -924,6 +1033,62 @@ const styles = StyleSheet.create({
   clearText: {
     fontSize: 11.5,
     fontWeight: "500",
+  },
+  bottomDock: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  bottomDockInner: {
+    width: "100%",
+    maxWidth: 720,
+    alignSelf: "center",
+    gap: 8,
+  },
+  targetSelectorRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  targetChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    maxWidth: 200,
+  },
+  targetChipText: {
+    fontSize: 12,
+    fontWeight: "500",
+    flexShrink: 1,
+  },
+  composerBox: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  plusSlot: {
+    width: 18,
+    height: 18,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  composerInput: {
+    flex: 1,
+    fontSize: 13.5,
+    paddingVertical: 2,
+  },
+  submitPill: {
+    width: 28,
+    height: 26,
+    borderRadius: 7,
+    alignItems: "center",
+    justifyContent: "center",
   },
   error: {
     fontSize: 12,
