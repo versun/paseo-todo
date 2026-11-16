@@ -6,11 +6,21 @@ import type {
 import { useRpc, useWorkspace } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, SidebarRow, TextInput } from "@getpaseo/plugin/client/ui";
 import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import {
+  KeyboardAvoidingView,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+  type StyleProp,
+  type ViewStyle,
+} from "react-native";
 import {
   addTodo,
+  editTodo,
   listTodos,
+  normalizeTaskText,
   removeTodo,
   toggleTodo,
   type TodoFile,
@@ -75,10 +85,11 @@ function useTodoMutation<Input extends { projectId: string | null }>(
     mutationKey: MUTATION_KEY,
     mutationFn,
     onMutate: async (input: Input) => {
-      await queryClient.cancelQueries({ queryKey: LIST_KEY });
+      const cancel = queryClient.cancelQueries({ queryKey: LIST_KEY });
       queryClient.setQueryData<TodoListData>(LIST_KEY, (prev) =>
         updateFile(prev, input.projectId, (items) => optimistic(items, input)),
       );
+      await cancel;
     },
     onSuccess: () => setError(null),
     onError: (cause) => setError(messageOf(cause)),
@@ -96,17 +107,29 @@ function useTodos() {
   const [actionError, setActionError] = useState<string | null>(null);
   const addRpc = useRpc(addTodo);
   const toggleRpc = useRpc(toggleTodo);
+  const editRpc = useRpc(editTodo);
   const removeRpc = useRpc(removeTodo);
 
   const add = useTodoMutation(
     addRpc,
-    (items, { text }) => [...items, { index: items.length, text, done: false }],
+    (items, { text }) => [
+      ...items,
+      { index: items.length, text: normalizeTaskText(text), done: false },
+    ],
     setActionError,
   );
   const toggle = useTodoMutation(
     toggleRpc,
     (items, { index }) =>
       items.map((item) => (item.index === index ? { ...item, done: !item.done } : item)),
+    setActionError,
+  );
+  const edit = useTodoMutation(
+    editRpc,
+    (items, { index, newText }) =>
+      items.map((item) =>
+        item.index === index ? { ...item, text: normalizeTaskText(newText) } : item,
+      ),
     setActionError,
   );
   const remove = useTodoMutation(
@@ -119,11 +142,19 @@ function useTodos() {
   return {
     data: query.data,
     error: actionError ?? (query.error ? messageOf(query.error) : null),
-    add: (projectId: string | null, text: string) => add.mutateAsync({ projectId, text }),
-    toggle: (file: TodoFile, item: TodoItem) =>
-      toggle.mutate({ projectId: file.projectId, index: item.index, text: item.text }),
-    remove: (file: TodoFile, item: TodoItem) =>
-      remove.mutate({ projectId: file.projectId, index: item.index, text: item.text }),
+    add: (projectId: string | null, text: string) =>
+      add.mutateAsync({ projectId, text: normalizeTaskText(text) }),
+    toggle: (file: TodoFile, index: number, text: string) =>
+      toggle.mutate({ projectId: file.projectId, index, text }),
+    edit: (file: TodoFile, index: number, text: string, newText: string) =>
+      edit.mutate({
+        projectId: file.projectId,
+        index,
+        text,
+        newText: normalizeTaskText(newText),
+      }),
+    remove: (file: TodoFile, index: number, text: string) =>
+      remove.mutate({ projectId: file.projectId, index, text }),
     clearCompleted: (file: TodoFile) => remove.mutate({ projectId: file.projectId }),
   };
 }
@@ -174,22 +205,73 @@ function TodoRow({
   last,
   theme,
   onToggle,
+  onEdit,
   onRemove,
 }: {
   item: TodoItem;
   last: boolean;
   theme: TodoTheme;
-  onToggle: () => void;
-  onRemove: () => void;
+  onToggle: (text: string) => void;
+  onEdit: (text: string, newText: string) => void;
+  onRemove: (text: string) => void;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(item.text);
+  // Tracks the authoritative text for this row, including an optimistic edit
+  // committed earlier in the same gesture before React has re-rendered.
+  const currentText = useRef(item.text);
+  const prevPropText = useRef(item.text);
+  const prevPropDone = useRef(item.done);
+  // onSubmitEditing, onBlur, and row actions can overlap; commit at most once.
+  const committed = useRef(false);
+
+  if (item.text !== prevPropText.current || item.done !== prevPropDone.current) {
+    const externalChange =
+      item.text !== currentText.current || item.done !== prevPropDone.current;
+    prevPropText.current = item.text;
+    prevPropDone.current = item.done;
+    currentText.current = item.text;
+    if (editing && externalChange) {
+      committed.current = true;
+      setEditing(false);
+      setDraft(item.text);
+    }
+  }
+
+  // Never let an unmount blur (e.g. Clear or filter switch) fire a stale edit.
+  useLayoutEffect(
+    () => () => {
+      committed.current = true;
+    },
+    [],
+  );
+
+  const commit = (): string => {
+    if (committed.current) return currentText.current;
+    committed.current = true;
+    setEditing(false);
+    const next = normalizeTaskText(draft);
+    const prev = currentText.current;
+    if (next && next !== prev) {
+      currentText.current = next;
+      onEdit(prev, next);
+      return next;
+    }
+    return prev;
+  };
+
   return (
     <View style={[styles.row, !last && styles.divider, { borderBottomColor: theme.colors.border }]}>
       <Pressable
         accessibilityRole="checkbox"
         accessibilityState={{ checked: item.done }}
-        accessibilityLabel={item.text}
-        onPress={onToggle}
-        style={styles.rowMain}
+        accessibilityLabel={`${item.done ? "Uncheck" : "Check off"} ${item.text}`}
+        hitSlop={8}
+        onPress={() => {
+          const text = editing ? commit() : currentText.current;
+          onToggle(text);
+        }}
+        style={styles.checkboxHit}
       >
         <View
           style={[
@@ -204,23 +286,64 @@ function TodoRow({
             <Icon name="Check" size={11} color={theme.colors.accentForeground} />
           ) : null}
         </View>
-        <Text
-          style={[
-            styles.itemText,
-            {
-              color: item.done ? theme.colors.foregroundMuted : theme.colors.foreground,
-              textDecorationLine: item.done ? "line-through" : "none",
-            },
-          ]}
-        >
-          {item.text}
-        </Text>
       </Pressable>
+      {editing ? (
+        <TextInput
+          value={draft}
+          onChangeText={setDraft}
+          autoFocus
+          onSubmitEditing={() => {
+            commit();
+          }}
+          onBlur={() => {
+            commit();
+          }}
+          onKeyPress={({ nativeEvent }) => {
+            if (nativeEvent.key === "Escape") {
+              committed.current = true;
+              setDraft(currentText.current);
+              setEditing(false);
+            }
+          }}
+          returnKeyType="done"
+          accessibilityLabel={`Edit ${item.text}`}
+          style={[styles.itemText, styles.editInput, { color: theme.colors.foreground }]}
+        />
+      ) : (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Edit ${item.text}`}
+          onPress={() => {
+            committed.current = false;
+            setDraft(currentText.current);
+            setEditing(true);
+          }}
+          style={styles.rowMain}
+        >
+          <Text
+            style={[
+              styles.itemText,
+              {
+                color: item.done ? theme.colors.foregroundMuted : theme.colors.foreground,
+                textDecorationLine: item.done ? "line-through" : "none",
+              },
+            ]}
+          >
+            {item.text}
+          </Text>
+        </Pressable>
+      )}
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`Delete ${item.text}`}
         hitSlop={8}
-        onPress={onRemove}
+        onPress={() => {
+          if (editing) {
+            committed.current = true;
+            setEditing(false);
+          }
+          onRemove(currentText.current);
+        }}
         style={styles.deleteButton}
       >
         <Icon name="X" size={13} color={theme.colors.foregroundMuted} />
@@ -254,8 +377,9 @@ function TodoSection({
       item={item}
       last={last}
       theme={theme}
-      onToggle={() => todos.toggle(file, item)}
-      onRemove={() => todos.remove(file, item)}
+      onToggle={(text) => todos.toggle(file, item.index, text)}
+      onEdit={(text, newText) => todos.edit(file, item.index, text, newText)}
+      onRemove={(text) => todos.remove(file, item.index, text)}
     />
   );
 
@@ -419,12 +543,12 @@ function TodoBottomComposer({
 }) {
   const [draft, setDraft] = useState("");
   const [focused, setFocused] = useState(false);
-  const hasDraft = draft.trim() !== "";
+  const hasDraft = normalizeTaskText(draft) !== "";
 
   // Clear right away (the add is optimistic) and keep the input editable, so
   // focus stays for the next task. Restore the text if the add fails.
   const submit = () => {
-    const text = draft.trim();
+    const text = normalizeTaskText(draft);
     if (!text) return;
     setDraft("");
     onAdd(target.projectId, text).catch(() => setDraft((current) => current || text));
@@ -535,6 +659,44 @@ function TodoBottomComposer({
   );
 }
 
+/**
+ * Shifts the bottom composer above the software keyboard on mobile.
+ * `KeyboardAvoidingView` compares its local `layout.y` (0 inside Paseo's body
+ * container) against `keyboardFrame.screenY`, so we measure the container's
+ * window `y` offset (status bar + host header) and pass it as
+ * `keyboardVerticalOffset`.
+ */
+function KeyboardAvoidingSurface({
+  style,
+  children,
+}: {
+  style: StyleProp<ViewStyle>;
+  children: ReactNode;
+}) {
+  const ref = useRef<View>(null);
+  const [verticalOffset, setVerticalOffset] = useState(0);
+
+  return (
+    <View
+      ref={ref}
+      style={styles.fill}
+      onLayout={() => {
+        ref.current?.measureInWindow((_x, y) => {
+          if (Number.isFinite(y)) setVerticalOffset(Math.round(y));
+        });
+      }}
+    >
+      <KeyboardAvoidingView
+        style={style}
+        behavior="padding"
+        keyboardVerticalOffset={verticalOffset}
+      >
+        {children}
+      </KeyboardAvoidingView>
+    </View>
+  );
+}
+
 export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
   const todos = useTodos();
   const [filter, setFilter] = useState<FilterMode>("all");
@@ -559,7 +721,7 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
   const target = files.find((file) => file.projectId === targetProjectId) ?? GLOBAL_TARGET;
 
   return (
-    <View style={[styles.fill, { backgroundColor: theme.colors.surface0 }]}>
+    <KeyboardAvoidingSurface style={[styles.fill, { backgroundColor: theme.colors.surface0 }]}>
       <ScrollView
         style={styles.fill}
         contentContainerStyle={[styles.screenContent, { padding: layout.compact ? 16 : 28 }]}
@@ -654,7 +816,7 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
         onAdd={todos.add}
         error={todos.error}
       />
-    </View>
+    </KeyboardAvoidingSurface>
   );
 }
 
@@ -688,7 +850,7 @@ export function WorkspaceTodosPanel({ theme, workspaceId }: PluginWorkspacePanel
   }
 
   return (
-    <View style={[styles.fill, { backgroundColor: theme.colors.surface0 }]}>
+    <KeyboardAvoidingSurface style={[styles.fill, { backgroundColor: theme.colors.surface0 }]}>
       <ScrollView
         style={styles.fill}
         contentContainerStyle={styles.panelContent}
@@ -703,7 +865,7 @@ export function WorkspaceTodosPanel({ theme, workspaceId }: PluginWorkspacePanel
         onAdd={todos.add}
         error={todos.error}
       />
-    </View>
+    </KeyboardAvoidingSurface>
   );
 }
 
@@ -852,13 +1014,16 @@ const styles = StyleSheet.create({
     alignItems: "center",
     paddingHorizontal: 12,
     paddingVertical: 9,
-    gap: 8,
+    gap: 10,
   },
   rowMain: {
     flex: 1,
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
+  },
+  checkboxHit: {
+    alignItems: "center",
+    justifyContent: "center",
   },
   checkbox: {
     width: 18,
@@ -872,6 +1037,11 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: 13.5,
     lineHeight: 19,
+  },
+  editInput: {
+    padding: 0,
+    paddingVertical: 0,
+    margin: 0,
   },
   deleteButton: {
     width: 22,

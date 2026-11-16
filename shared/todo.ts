@@ -20,6 +20,11 @@ export type TodoItem = z.infer<typeof todoItemSchema>;
 export type TodoFile = z.infer<typeof todoFileSchema>;
 export type TodoListData = z.infer<typeof listTodos.output>;
 
+/** Collapse any embedded line breaks so a task is always a single Markdown line. */
+export function normalizeTaskText(text: string): string {
+  return text.replace(/\s*[\r\n\u2028\u2029]+\s*/g, " ").trim();
+}
+
 export const listTodos = defineRpc({
   name: "todo.list",
   input: z.object({}),
@@ -49,6 +54,18 @@ export const toggleTodo = defineRpc({
     projectId: z.string().nullable(),
     index: z.number().int().nonnegative(),
     text: z.string(),
+  }),
+  output: z.object({ ok: z.boolean() }),
+});
+
+export const editTodo = defineRpc({
+  name: "todo.edit",
+  input: z.object({
+    projectId: z.string().nullable(),
+    index: z.number().int().nonnegative(),
+    /** The item text the client last saw; mismatches are refused like toggle/remove. */
+    text: z.string(),
+    newText: z.string().trim().min(1),
   }),
   output: z.object({ ok: z.boolean() }),
 });

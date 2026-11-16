@@ -52,6 +52,8 @@ const add = (text: string, projectId: string | null = P) =>
   server.addTodoHandler({ projectId, text }, ctx);
 const toggle = (index: number, text: string) =>
   server.toggleTodoHandler({ projectId: P, index, text }, ctx);
+const edit = (index: number, text: string, newText: string) =>
+  server.editTodoHandler({ projectId: P, index, text, newText }, ctx);
 const remove = (index?: number, text?: string) =>
   server.removeTodoHandler({ projectId: P, index, text }, ctx);
 const itemsOf = async () => (await server.listTodosHandler({}, ctx)).projects[0].items;
@@ -103,6 +105,45 @@ describe("line endings", () => {
     writeFileSync(FILE, "- [ ] a");
     await add("b");
     assert.equal(read(), "- [ ] a\n- [ ] b\n");
+  });
+});
+
+describe("edit", () => {
+  test("replaces the task text and keeps indent, marker, state and spacing", async () => {
+    writeFileSync(FILE, "# T\n- [ ] alpha\n  * [X]   beta\n");
+    await edit(1, "beta", "renamed");
+    assert.equal(read(), "# T\n- [ ] alpha\n  * [X]   renamed\n");
+    assert.deepEqual((await itemsOf()).map((item) => item.text), ["alpha", "renamed"]);
+  });
+
+  test("keeps CRLF and collapses embedded line breaks and Unicode separators", async () => {
+    writeFileSync(FILE, "# T\r\n- [ ] alpha\r\n- [ ] beta\r\n");
+    await edit(0, "alpha", "  one\r\ntwo\u2028three\u2029four  ");
+    assert.equal(read(), "# T\r\n- [ ] one two three four\r\n- [ ] beta\r\n");
+  });
+
+  test("edit followed immediately by toggle or remove uses the updated text", async () => {
+    writeFileSync(FILE, "- [ ] alpha\n- [ ] beta\n");
+    await Promise.all([edit(0, "alpha", "alpha2"), toggle(0, "alpha2")]);
+    assert.equal(read(), "- [x] alpha2\n- [ ] beta\n");
+    await Promise.all([edit(1, "beta", "beta2"), remove(1, "beta2")]);
+    assert.equal(read(), "- [x] alpha2\n");
+  });
+
+  test("stale or empty text is refused and a no-op edit does not touch the file", async () => {
+    writeFileSync(FILE, "- [ ] a b\n");
+    await assert.rejects(edit(0, "nope", "b"), /changed on disk/);
+    await assert.rejects(edit(0, "a b", "  \r\n\u2028  "), /cannot be empty/);
+    const before = statSync(FILE).ino;
+    await edit(0, "a b", "a b");
+    await edit(0, "a b", " a\nb ");
+    assert.equal(statSync(FILE).ino, before);
+    assert.equal(read(), "- [ ] a b\n");
+  });
+
+  test("edit never creates a missing file", async () => {
+    await assert.rejects(edit(0, "a", "b"), /changed on disk/);
+    assert.equal(existsSync(FILE), false);
   });
 });
 

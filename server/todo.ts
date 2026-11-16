@@ -6,7 +6,9 @@ import type { RpcInput } from "@getpaseo/plugin";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import {
   addTodo,
+  editTodo,
   listTodos,
+  normalizeTaskText,
   removeTodo,
   toggleTodo,
   type TodoItem,
@@ -18,7 +20,7 @@ type Project = Awaited<ReturnType<PaseoApi["projects"]["list"]>>["projects"][num
 const HOME_DIR = resolve(homedir());
 const GLOBAL_FILE = join(HOME_DIR, "TODO.md");
 const PASEO_HOME = join(HOME_DIR, ".paseo");
-const CHECKBOX = /^(\s*[-*+]\s+\[)([ xX])(\]\s+(.*?))$/;
+const CHECKBOX = /^(\s*[-*+]\s+\[)([ xX])(\]\s+)(.*?)$/;
 const STALE_TASK = "This task changed on disk. Refresh and try again.";
 const PROJECTS_TIMEOUT_MS = 10_000;
 
@@ -250,7 +252,8 @@ export async function addTodoHandler(
 ) {
   // A task is one line; embedded newlines would otherwise inject extra items.
   // U+2028/U+2029 count too: CHECKBOX's `.` does not match them.
-  const task = text.replace(/\s*[\r\n\u2028\u2029]+\s*/g, " ");
+  const task = normalizeTaskText(text);
+  if (!task) throw new Error("Task text cannot be empty");
   return mutateTodoFile(paseo, projectId, (existing) => {
     const lines = splitLines(existing);
     const last = lines[lines.length - 1];
@@ -268,7 +271,22 @@ export async function toggleTodoHandler(
   return mutateTodoFile(paseo, projectId, (existing) => {
     const lines = splitLines(existing);
     const { line, match } = locateLine(lines, index, text);
-    lines[line].text = `${match[1]}${match[2] === " " ? "x" : " "}${match[3]}`;
+    lines[line].text = `${match[1]}${match[2] === " " ? "x" : " "}${match[3]}${match[4]}`;
+    return joinLines(lines);
+  });
+}
+
+export async function editTodoHandler(
+  { projectId, index, text, newText }: RpcInput<typeof editTodo>,
+  { paseo }: PluginHandlerContext,
+) {
+  const task = normalizeTaskText(newText);
+  if (!task) throw new Error("Task text cannot be empty");
+  return mutateTodoFile(paseo, projectId, (existing) => {
+    const lines = splitLines(existing);
+    const { line, match } = locateLine(lines, index, text);
+    if (match[4].trim() === task) return null; // No-op edit leaves the file alone.
+    lines[line].text = `${match[1]}${match[2]}${match[3]}${task}`;
     return joinLines(lines);
   });
 }
