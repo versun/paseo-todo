@@ -38,21 +38,34 @@ export const addTodo = defineRpc({
   output: z.object({ ok: z.boolean() }),
 });
 
+/**
+ * `text` is the item content the client last saw. The server compares it before
+ * mutating so a stale `index` (the file changed since the last poll) can never
+ * toggle or delete the wrong task.
+ */
 export const toggleTodo = defineRpc({
   name: "todo.toggle",
   input: z.object({
     projectId: z.string().nullable(),
     index: z.number().int().nonnegative(),
+    text: z.string(),
   }),
   output: z.object({ ok: z.boolean() }),
 });
 
 export const removeTodo = defineRpc({
   name: "todo.remove",
-  input: z.object({
-    projectId: z.string().nullable(),
-    /** Omit `index` to clear all completed items in the target file. */
-    index: z.number().int().nonnegative().optional(),
-  }),
+  input: z
+    .object({
+      projectId: z.string().nullable(),
+      /** Omit `index` to clear all completed items in the target file. */
+      index: z.number().int().nonnegative().optional(),
+      /** Required with `index`: the item text the client last saw. */
+      text: z.string().optional(),
+    })
+    .refine((value) => value.index === undefined || value.text !== undefined, {
+      message: "text is required when index is provided",
+      path: ["text"],
+    }),
   output: z.object({ ok: z.boolean() }),
 });

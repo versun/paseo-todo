@@ -5,7 +5,7 @@ import type {
 } from "@getpaseo/plugin/client";
 import { useRpc, useWorkspace } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, SidebarRow, TextInput } from "@getpaseo/plugin/client/ui";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import {
@@ -18,115 +18,121 @@ import {
   type TodoListData,
 } from "../shared/todo";
 
-const QUERY_KEY = ["todos"];
+const LIST_KEY = ["todo", "list"];
+const MUTATION_KEY = ["todo", "mutation"];
+const POLL_MS = 2000;
+const GLOBAL_TARGET = { projectId: null, label: "Global" };
 
 type TodoTheme = PluginScreenProps["theme"];
+type TodoTarget = Pick<TodoFile, "projectId" | "label">;
 type FilterMode = "all" | "global" | "projects";
 
 function messageOf(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function reindex(items: TodoItem[]): TodoItem[] {
-  return items.map((item, idx) => ({ ...item, index: idx }));
+function openCount(files: TodoFile[]) {
+  return files.reduce((sum, file) => sum + file.items.filter((item) => !item.done).length, 0);
 }
 
-function updateMatchingFiles(
+/** Apply an optimistic edit to the target file, and to any project sharing its path. */
+function updateFile(
   data: TodoListData | undefined,
   projectId: string | null,
   updater: (items: TodoItem[]) => TodoItem[],
 ): TodoListData | undefined {
   if (!data) return data;
-  const targetPath =
+  const path =
     projectId === null
       ? data.global.path
-      : data.projects.find((item) => item.projectId === projectId)?.path;
-  if (!targetPath) return data;
+      : data.projects.find((file) => file.projectId === projectId)?.path;
+  if (!path) return data;
   const apply = (file: TodoFile): TodoFile =>
-    file.path === targetPath ? { ...file, items: reindex(updater(file.items)) } : file;
-  return {
-    global: apply(data.global),
-    projects: data.projects.map(apply),
-  };
+    file.path === path
+      ? { ...file, items: updater(file.items).map((item, index) => ({ ...item, index })) }
+      : file;
+  return { global: apply(data.global), projects: data.projects.map(apply) };
 }
 
-export function useTodos() {
+/** Polling pauses while a mutation is in flight so a poll cannot revert an optimistic edit. */
+function useTodoList() {
   const list = useRpc(listTodos);
+  const mutating = useIsMutating({ mutationKey: MUTATION_KEY }) > 0;
+  return useQuery({
+    queryKey: LIST_KEY,
+    queryFn: () => list({}),
+    refetchInterval: mutating ? false : POLL_MS,
+  });
+}
+
+function useTodoMutation<Input extends { projectId: string | null }>(
+  mutationFn: (input: Input) => Promise<unknown>,
+  optimistic: (items: TodoItem[], input: Input) => TodoItem[],
+  setError: (error: string | null) => void,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: MUTATION_KEY,
+    mutationFn,
+    onMutate: async (input: Input) => {
+      await queryClient.cancelQueries({ queryKey: LIST_KEY });
+      queryClient.setQueryData<TodoListData>(LIST_KEY, (prev) =>
+        updateFile(prev, input.projectId, (items) => optimistic(items, input)),
+      );
+    },
+    onSuccess: () => setError(null),
+    onError: (cause) => setError(messageOf(cause)),
+    // Refetch only after the last overlapping mutation; an earlier refetch would
+    // flash back the optimistic edits still in flight. A failed edit is undone here.
+    onSettled: () =>
+      queryClient.isMutating({ mutationKey: MUTATION_KEY }) === 1
+        ? queryClient.invalidateQueries({ queryKey: LIST_KEY })
+        : undefined,
+  });
+}
+
+function useTodos() {
+  const query = useTodoList();
+  const [actionError, setActionError] = useState<string | null>(null);
   const addRpc = useRpc(addTodo);
   const toggleRpc = useRpc(toggleTodo);
   const removeRpc = useRpc(removeTodo);
-  const queryClient = useQueryClient();
 
-  const query = useQuery({
-    queryKey: QUERY_KEY,
-    queryFn: () => list({}),
-    refetchInterval: 2000,
-  });
-
-  const invalidate = () => queryClient.invalidateQueries({ queryKey: QUERY_KEY });
-
-  const addMutation = useMutation({
-    mutationFn: addRpc,
-    onMutate: async ({ projectId, text }) => {
-      await queryClient.cancelQueries({ queryKey: QUERY_KEY });
-      queryClient.setQueryData<TodoListData>(QUERY_KEY, (prev) =>
-        updateMatchingFiles(prev, projectId, (items) => [
-          ...items,
-          { index: items.length, text, done: false },
-        ]),
-      );
-    },
-    onSettled: invalidate,
-  });
-
-  const toggleMutation = useMutation({
-    mutationFn: toggleRpc,
-    onMutate: async ({ projectId, index }) => {
-      await queryClient.cancelQueries({ queryKey: QUERY_KEY });
-      queryClient.setQueryData<TodoListData>(QUERY_KEY, (prev) =>
-        updateMatchingFiles(prev, projectId, (items) =>
-          items.map((item) => (item.index === index ? { ...item, done: !item.done } : item)),
-        ),
-      );
-    },
-    onSettled: invalidate,
-  });
-
-  const removeMutation = useMutation({
-    mutationFn: removeRpc,
-    onMutate: async ({ projectId, index }) => {
-      await queryClient.cancelQueries({ queryKey: QUERY_KEY });
-      queryClient.setQueryData<TodoListData>(QUERY_KEY, (prev) =>
-        updateMatchingFiles(prev, projectId, (items) =>
-          items.filter((item) => (index !== undefined ? item.index !== index : !item.done)),
-        ),
-      );
-    },
-    onSettled: invalidate,
-  });
+  const add = useTodoMutation(
+    addRpc,
+    (items, { text }) => [...items, { index: items.length, text, done: false }],
+    setActionError,
+  );
+  const toggle = useTodoMutation(
+    toggleRpc,
+    (items, { index }) =>
+      items.map((item) => (item.index === index ? { ...item, done: !item.done } : item)),
+    setActionError,
+  );
+  const remove = useTodoMutation(
+    removeRpc,
+    (items, { index }) =>
+      items.filter((item) => (index === undefined ? !item.done : item.index !== index)),
+    setActionError,
+  );
 
   return {
     data: query.data,
-    error: query.error,
-    add: (projectId: string | null, text: string) =>
-      addMutation.mutateAsync({ projectId, text }),
-    toggle: (projectId: string | null, index: number) =>
-      toggleMutation.mutateAsync({ projectId, index }),
-    remove: (projectId: string | null, index?: number) =>
-      removeMutation.mutateAsync({ projectId, index }),
+    error: actionError ?? (query.error ? messageOf(query.error) : null),
+    add: (projectId: string | null, text: string) => add.mutateAsync({ projectId, text }),
+    toggle: (file: TodoFile, item: TodoItem) =>
+      toggle.mutate({ projectId: file.projectId, index: item.index, text: item.text }),
+    remove: (file: TodoFile, item: TodoItem) =>
+      remove.mutate({ projectId: file.projectId, index: item.index, text: item.text }),
+    clearCompleted: (file: TodoFile) => remove.mutate({ projectId: file.projectId }),
   };
 }
 
-type TodoActions = Pick<ReturnType<typeof useTodos>, "add" | "toggle" | "remove">;
+type TodoActions = ReturnType<typeof useTodos>;
 
 export function TodoSidebarItem({ theme, currentScreen, openScreen }: PluginSidebarItemProps) {
-  const { data } = useTodos();
-  const openCount = data
-    ? [data.global, ...data.projects].reduce(
-        (sum, file) => sum + file.items.filter((item) => !item.done).length,
-        0,
-      )
-    : 0;
+  const { data } = useTodoList();
+  const count = data ? openCount([data.global, ...data.projects]) : 0;
 
   return (
     <SidebarRow
@@ -134,15 +140,32 @@ export function TodoSidebarItem({ theme, currentScreen, openScreen }: PluginSide
       active={currentScreen?.screenId === "todos"}
       onPress={() => openScreen({ screenId: "todos" })}
       trailing={
-        openCount > 0 ? (
-          <View style={[styles.sidebarBadge, { backgroundColor: theme.colors.surface2 }]}>
-            <Text style={[styles.sidebarBadgeText, { color: theme.colors.foregroundMuted }]}>
-              {openCount}
+        count > 0 ? (
+          <View style={[styles.badge, { backgroundColor: theme.colors.surface2 }]}>
+            <Text style={[styles.badgeText, { color: theme.colors.foregroundMuted }]}>
+              {count}
             </Text>
           </View>
         ) : undefined
       }
     />
+  );
+}
+
+function ProgressBar({ theme, done, total }: { theme: TodoTheme; done: number; total: number }) {
+  return (
+    <View style={[styles.progressTrack, { backgroundColor: theme.colors.surface2 }]}>
+      <View
+        style={[
+          styles.progressFill,
+          {
+            width: `${total > 0 ? Math.round((done / total) * 100) : 0}%`,
+            backgroundColor:
+              total > 0 && done === total ? theme.colors.statusSuccess : theme.colors.accent,
+          },
+        ]}
+      />
+    </View>
   );
 }
 
@@ -160,15 +183,7 @@ function TodoRow({
   onRemove: () => void;
 }) {
   return (
-    <View
-      style={[
-        styles.row,
-        !last && {
-          borderBottomWidth: StyleSheet.hairlineWidth,
-          borderBottomColor: theme.colors.border,
-        },
-      ]}
-    >
+    <View style={[styles.row, !last && styles.divider, { borderBottomColor: theme.colors.border }]}>
       <Pressable
         accessibilityRole="checkbox"
         accessibilityState={{ checked: item.done }}
@@ -217,68 +232,55 @@ function TodoRow({
 function TodoSection({
   file,
   theme,
-  actions,
+  todos,
   compactHeader = false,
   onOpenWorkspace,
 }: {
   file: TodoFile;
   theme: TodoTheme;
-  actions: TodoActions;
+  todos: TodoActions;
   compactHeader?: boolean;
   onOpenWorkspace?: () => void;
 }) {
   const [showDone, setShowDone] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
   const openItems = file.items.filter((item) => !item.done);
   const doneItems = file.items.filter((item) => item.done);
-  const totalCount = file.items.length;
-  const progress = totalCount > 0 ? doneItems.length / totalCount : 0;
-
-  const runAction = (promise: Promise<unknown>) => {
-    promise.then(() => setError(null)).catch((cause) => setError(messageOf(cause)));
-  };
-
+  const total = file.items.length;
   const isGlobal = file.projectId === null;
-  const displayPath = isGlobal ? "~/TODO.md" : file.path;
+
+  const renderRow = (item: TodoItem, last: boolean) => (
+    <TodoRow
+      key={item.index}
+      item={item}
+      last={last}
+      theme={theme}
+      onToggle={() => todos.toggle(file, item)}
+      onRemove={() => todos.remove(file, item)}
+    />
+  );
 
   return (
     <View style={styles.section}>
       {compactHeader ? (
         <View style={styles.compactHeader}>
-          <View style={styles.compactMetaRow}>
+          <View style={styles.spacedRow}>
             <Text style={[styles.compactStatus, { color: theme.colors.foreground }]}>
-              {openItems.length === 0 && doneItems.length > 0
-                ? "All done"
-                : `${openItems.length} remaining`}
+              {openItems.length === 0 && total > 0 ? "All done" : `${openItems.length} remaining`}
             </Text>
             {doneItems.length > 0 ? (
               <Text style={[styles.compactDoneCount, { color: theme.colors.foregroundMuted }]}>
-                {doneItems.length}/{totalCount} completed
+                {doneItems.length}/{total} completed
               </Text>
             ) : null}
           </View>
-          <View style={[styles.progressTrack, { backgroundColor: theme.colors.surface2 }]}>
-            <View
-              style={[
-                styles.progressFill,
-                {
-                  width: `${Math.round(progress * 100)}%`,
-                  backgroundColor:
-                    progress === 1 ? theme.colors.statusSuccess : theme.colors.accent,
-                },
-              ]}
-            />
-          </View>
+          <ProgressBar theme={theme} done={doneItems.length} total={total} />
         </View>
       ) : (
         <View style={styles.sectionHeader}>
           <View
             style={[
-              styles.sectionIconWrap,
-              {
-                backgroundColor: isGlobal ? theme.colors.accent : theme.colors.surface2,
-              },
+              styles.sectionIcon,
+              { backgroundColor: isGlobal ? theme.colors.accent : theme.colors.surface2 },
             ]}
           >
             <Icon
@@ -289,52 +291,41 @@ function TodoSection({
           </View>
           <View style={styles.sectionTitleBlock}>
             <Text style={[styles.sectionTitle, { color: theme.colors.foreground }]} numberOfLines={1}>
-              {isGlobal ? "Global" : file.label}
+              {file.label}
             </Text>
             <Text
               style={[styles.sectionPath, { color: theme.colors.foregroundMuted }]}
               numberOfLines={1}
               ellipsizeMode="middle"
             >
-              {displayPath}
+              {isGlobal ? "~/TODO.md" : file.path}
             </Text>
           </View>
-          <View style={styles.sectionRight}>
-            {openItems.length > 0 ? (
-              <View style={[styles.countBadge, { backgroundColor: theme.colors.surface2 }]}>
-                <Text style={[styles.countBadgeText, { color: theme.colors.foreground }]}>
-                  {openItems.length}
-                </Text>
-              </View>
-            ) : doneItems.length > 0 ? (
-              <Icon name="CheckCircle2" size={15} color={theme.colors.statusSuccess} />
-            ) : null}
-            {onOpenWorkspace ? (
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel={`Open ${file.label}`}
-                hitSlop={6}
-                onPress={onOpenWorkspace}
-                style={[styles.openWorkspaceButton, { borderColor: theme.colors.border }]}
-              >
-                <Icon name="ArrowUpRight" size={13} color={theme.colors.foregroundMuted} />
-              </Pressable>
-            ) : null}
-          </View>
+          {openItems.length > 0 ? (
+            <View style={[styles.badge, { backgroundColor: theme.colors.surface2 }]}>
+              <Text style={[styles.badgeText, { color: theme.colors.foreground }]}>
+                {openItems.length}
+              </Text>
+            </View>
+          ) : (
+            <Icon name="CheckCircle2" size={15} color={theme.colors.statusSuccess} />
+          )}
+          {onOpenWorkspace ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`Open ${file.label}`}
+              hitSlop={6}
+              onPress={onOpenWorkspace}
+              style={[styles.openWorkspaceButton, { borderColor: theme.colors.border }]}
+            >
+              <Icon name="ArrowUpRight" size={13} color={theme.colors.foregroundMuted} />
+            </Pressable>
+          ) : null}
         </View>
       )}
 
-      {totalCount === 0 ? (
-        <View
-          style={[
-            styles.emptyCard,
-            { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
-          ]}
-        >
-          <Text style={[styles.emptyText, { color: theme.colors.foregroundMuted }]}>
-            No tasks yet — add one below.
-          </Text>
-        </View>
+      {total === 0 ? (
+        <EmptyCard theme={theme} text="No tasks yet — add one below." />
       ) : (
         <View
           style={[
@@ -342,25 +333,18 @@ function TodoSection({
             { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
           ]}
         >
-          {openItems.map((item, idx) => (
-            <TodoRow
-              key={item.index}
-              item={item}
-              last={idx === openItems.length - 1 && doneItems.length === 0}
-              theme={theme}
-              onToggle={() => runAction(actions.toggle(file.projectId, item.index))}
-              onRemove={() => runAction(actions.remove(file.projectId, item.index))}
-            />
-          ))}
-
+          {openItems.map((item, idx) =>
+            renderRow(item, idx === openItems.length - 1 && doneItems.length === 0),
+          )}
           {doneItems.length > 0 ? (
-            <View>
+            <>
               <View
                 style={[
+                  styles.spacedRow,
                   styles.completedBar,
-                  { backgroundColor: theme.colors.surface0 },
-                  showDone && {
-                    borderBottomWidth: StyleSheet.hairlineWidth,
+                  showDone && styles.divider,
+                  {
+                    backgroundColor: theme.colors.surface0,
                     borderBottomColor: theme.colors.border,
                   },
                 ]}
@@ -376,7 +360,7 @@ function TodoSection({
                     size={13}
                     color={theme.colors.foregroundMuted}
                   />
-                  <Text style={[styles.completedLabel, { color: theme.colors.foregroundMuted }]}>
+                  <Text style={[styles.completedText, { color: theme.colors.foregroundMuted }]}>
                     Completed · {doneItems.length}
                   </Text>
                 </Pressable>
@@ -384,80 +368,66 @@ function TodoSection({
                   accessibilityRole="button"
                   accessibilityLabel="Clear completed tasks"
                   hitSlop={6}
-                  onPress={() => runAction(actions.remove(file.projectId))}
+                  onPress={() => todos.clearCompleted(file)}
                 >
-                  <Text style={[styles.clearText, { color: theme.colors.foregroundMuted }]}>
+                  <Text style={[styles.completedText, { color: theme.colors.foregroundMuted }]}>
                     Clear
                   </Text>
                 </Pressable>
               </View>
               {showDone
-                ? doneItems.map((item, idx) => (
-                    <TodoRow
-                      key={item.index}
-                      item={item}
-                      last={idx === doneItems.length - 1}
-                      theme={theme}
-                      onToggle={() => runAction(actions.toggle(file.projectId, item.index))}
-                      onRemove={() => runAction(actions.remove(file.projectId, item.index))}
-                    />
-                  ))
+                ? doneItems.map((item, idx) => renderRow(item, idx === doneItems.length - 1))
                 : null}
-            </View>
+            </>
           ) : null}
         </View>
       )}
-
-      {error ? (
-        <Text style={[styles.error, { color: theme.colors.statusDanger }]}>{error}</Text>
-      ) : null}
     </View>
   );
 }
 
-interface ComposerTarget {
-  projectId: string | null;
-  label: string;
+function EmptyCard({ theme, text }: { theme: TodoTheme; text: string }) {
+  return (
+    <View
+      style={[
+        styles.emptyCard,
+        { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
+      ]}
+    >
+      <Text style={[styles.emptyText, { color: theme.colors.foregroundMuted }]}>{text}</Text>
+    </View>
+  );
 }
 
+/** The single add field. Shows the target picker only when `targets` is given. */
 function TodoBottomComposer({
   theme,
   compact,
-  projectId,
-  targetLabel,
+  target,
   targets,
-  onSelectProject,
+  onSelectTarget,
   onAdd,
+  error,
 }: {
   theme: TodoTheme;
-  compact?: boolean;
-  projectId: string | null;
-  targetLabel: string;
-  targets?: ComposerTarget[];
-  onSelectProject?: (projectId: string | null) => void;
+  compact: boolean;
+  target: TodoTarget;
+  targets?: TodoTarget[];
+  onSelectTarget?: (projectId: string | null) => void;
   onAdd: (projectId: string | null, text: string) => Promise<unknown>;
+  error: string | null;
 }) {
   const [draft, setDraft] = useState("");
   const [focused, setFocused] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const hasDraft = draft.trim() !== "";
 
-  const canSubmit = draft.trim() !== "" && !busy;
-
-  const submit = async () => {
+  // Clear right away (the add is optimistic) and keep the input editable, so
+  // focus stays for the next task. Restore the text if the add fails.
+  const submit = () => {
     const text = draft.trim();
-    if (!text || busy) return;
-    setBusy(true);
+    if (!text) return;
     setDraft("");
-    try {
-      await onAdd(projectId, text);
-      setError(null);
-    } catch (cause) {
-      setDraft(text);
-      setError(messageOf(cause));
-    } finally {
-      setBusy(false);
-    }
+    onAdd(target.projectId, text).catch(() => setDraft((current) => current || text));
   };
 
   return (
@@ -473,52 +443,38 @@ function TodoBottomComposer({
       ]}
     >
       <View style={styles.bottomDockInner}>
-        {targets && onSelectProject ? (
+        {targets && onSelectTarget ? (
           <ScrollView
             horizontal
             showsHorizontalScrollIndicator={false}
             keyboardShouldPersistTaps="handled"
-            contentContainerStyle={styles.targetSelectorRow}
+            contentContainerStyle={styles.targetRow}
           >
-            {targets.map((target) => {
-              const selected = target.projectId === projectId;
-              const isGlobal = target.projectId === null;
+            {targets.map((item) => {
+              const selected = item.projectId === target.projectId;
+              const foreground = selected ? theme.colors.accentForeground : theme.colors.foreground;
               return (
                 <Pressable
-                  key={target.projectId ?? "__global__"}
+                  key={item.projectId ?? "global"}
                   accessibilityRole="button"
                   accessibilityState={{ selected }}
-                  accessibilityLabel={`Target ${target.label}`}
-                  onPress={() => onSelectProject(target.projectId)}
+                  accessibilityLabel={`Target ${item.label}`}
+                  onPress={() => onSelectTarget(item.projectId)}
                   style={[
                     styles.targetChip,
                     {
-                      backgroundColor: selected
-                        ? theme.colors.accent
-                        : theme.colors.surface1,
+                      backgroundColor: selected ? theme.colors.accent : theme.colors.surface1,
                       borderColor: selected ? theme.colors.accent : theme.colors.border,
                     },
                   ]}
                 >
                   <Icon
-                    name={isGlobal ? "Inbox" : "FolderGit2"}
+                    name={item.projectId === null ? "Inbox" : "FolderGit2"}
                     size={12}
-                    color={
-                      selected ? theme.colors.accentForeground : theme.colors.foregroundMuted
-                    }
+                    color={selected ? foreground : theme.colors.foregroundMuted}
                   />
-                  <Text
-                    style={[
-                      styles.targetChipText,
-                      {
-                        color: selected
-                          ? theme.colors.accentForeground
-                          : theme.colors.foreground,
-                      },
-                    ]}
-                    numberOfLines={1}
-                  >
-                    {target.label}
+                  <Text style={[styles.targetChipText, { color: foreground }]} numberOfLines={1}>
+                    {item.label}
                   </Text>
                 </Pressable>
               );
@@ -535,17 +491,11 @@ function TodoBottomComposer({
             },
           ]}
         >
-          <View style={styles.plusSlot}>
-            <Icon
-              name="Plus"
-              size={15}
-              color={
-                focused || draft.trim() !== ""
-                  ? theme.colors.accent
-                  : theme.colors.foregroundMuted
-              }
-            />
-          </View>
+          <Icon
+            name="Plus"
+            size={15}
+            color={focused || hasDraft ? theme.colors.accent : theme.colors.foregroundMuted}
+          />
           <TextInput
             value={draft}
             onChangeText={setDraft}
@@ -553,29 +503,26 @@ function TodoBottomComposer({
             onBlur={() => setFocused(false)}
             onSubmitEditing={submit}
             blurOnSubmit={false}
-            editable={!busy}
             returnKeyType="done"
-            placeholder={`Add to ${targetLabel}…`}
+            placeholder={`Add to ${target.label}…`}
             placeholderTextColor={theme.colors.foregroundMuted}
-            accessibilityLabel={`Add a todo to ${targetLabel}`}
+            accessibilityLabel={`Add a todo to ${target.label}`}
             style={[styles.composerInput, { color: theme.colors.foreground }]}
           />
           <Pressable
             accessibilityRole="button"
             accessibilityLabel="Add todo"
-            disabled={!canSubmit}
+            disabled={!hasDraft}
             onPress={submit}
             style={[
-              styles.submitPill,
-              {
-                backgroundColor: canSubmit ? theme.colors.accent : theme.colors.surface2,
-              },
+              styles.submitButton,
+              { backgroundColor: hasDraft ? theme.colors.accent : theme.colors.surface2 },
             ]}
           >
             <Icon
               name="CornerDownLeft"
               size={12}
-              color={canSubmit ? theme.colors.accentForeground : theme.colors.foregroundMuted}
+              color={hasDraft ? theme.colors.accentForeground : theme.colors.foregroundMuted}
             />
           </Pressable>
         </View>
@@ -592,75 +539,34 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
   const todos = useTodos();
   const [filter, setFilter] = useState<FilterMode>("all");
   const [targetProjectId, setTargetProjectId] = useState<string | null>(null);
-  const data = todos.data;
+  const { data } = todos;
 
-  const allProjects = data ? data.projects : [];
-  const projectsWithTodos = allProjects.filter((file) => file.items.length > 0);
-  const showGlobalSection = Boolean(
-    data && filter !== "projects" && data.global.items.length > 0,
+  const files = data ? [data.global, ...data.projects] : [];
+  // Only groups with tasks are shown; the composer can still target any project.
+  const visibleFiles = files.filter(
+    (file) =>
+      file.items.length > 0 &&
+      (filter === "all" || (file.projectId === null) === (filter === "global")),
   );
-  const visibleProjects = filter === "global" ? [] : projectsWithTodos;
-
-  const countedFiles = data ? [data.global, ...projectsWithTodos] : [];
-  const totalOpen = countedFiles.reduce(
-    (sum, file) => sum + file.items.filter((item) => !item.done).length,
-    0,
-  );
-  const totalDone = countedFiles.reduce(
-    (sum, file) => sum + file.items.filter((item) => item.done).length,
-    0,
-  );
-  const totalItems = totalOpen + totalDone;
-  const totalProgress = totalItems > 0 ? totalDone / totalItems : 0;
-
+  const totalOpen = openCount(files);
+  const totalItems = files.reduce((sum, file) => sum + file.items.length, 0);
   const filters: { id: FilterMode; label: string; count: number }[] = [
     { id: "all", label: "All", count: totalOpen },
-    {
-      id: "global",
-      label: "Global",
-      count: data ? data.global.items.filter((item) => !item.done).length : 0,
-    },
-    {
-      id: "projects",
-      label: "Projects",
-      count: projectsWithTodos.reduce(
-        (sum, file) => sum + file.items.filter((item) => !item.done).length,
-        0,
-      ),
-    },
+    { id: "global", label: "Global", count: data ? openCount([data.global]) : 0 },
+    { id: "projects", label: "Projects", count: data ? openCount(data.projects) : 0 },
   ];
-
-  const composerTargets: ComposerTarget[] = [
-    { projectId: null, label: "Global" },
-    ...allProjects.map((file) => ({
-      projectId: file.projectId,
-      label: file.label,
-    })),
-  ];
-
-  const effectiveProjectId = composerTargets.some(
-    (item) => item.projectId === targetProjectId,
-  )
-    ? targetProjectId
-    : null;
-  const activeTargetLabel =
-    composerTargets.find((item) => item.projectId === effectiveProjectId)?.label ?? "Global";
+  // Falls back to Global when the chosen project disappears.
+  const target = files.find((file) => file.projectId === targetProjectId) ?? GLOBAL_TARGET;
 
   return (
-    <View style={{ flex: 1, backgroundColor: theme.colors.surface0 }}>
+    <View style={[styles.fill, { backgroundColor: theme.colors.surface0 }]}>
       <ScrollView
-        style={{ flex: 1 }}
-        contentContainerStyle={{
-          padding: layout.compact ? 16 : 28,
-          gap: 22,
-          width: "100%",
-          maxWidth: 720,
-          alignSelf: "center",
-        }}
+        style={styles.fill}
+        contentContainerStyle={[styles.screenContent, { padding: layout.compact ? 16 : 28 }]}
         keyboardShouldPersistTaps="handled"
       >
         <View style={styles.screenHeader}>
-          <View style={styles.screenTopRow}>
+          <View style={[styles.spacedRow, styles.screenTopRow]}>
             <View
               style={[
                 styles.filterBar,
@@ -675,10 +581,7 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
                     accessibilityRole="tab"
                     accessibilityState={{ selected: active }}
                     onPress={() => setFilter(tab.id)}
-                    style={[
-                      styles.filterTab,
-                      active && { backgroundColor: theme.colors.surface2 },
-                    ]}
+                    style={[styles.filterTab, active && { backgroundColor: theme.colors.surface2 }]}
                   >
                     <Text
                       style={[
@@ -707,62 +610,37 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
             </View>
             {data ? (
               <Text style={[styles.summaryText, { color: theme.colors.foregroundMuted }]}>
-                {totalOpen} open · {totalDone} done
+                {totalOpen} open · {totalItems - totalOpen} done
               </Text>
             ) : null}
           </View>
           {totalItems > 0 ? (
-            <View style={[styles.progressTrack, { backgroundColor: theme.colors.surface2 }]}>
-              <View
-                style={[
-                  styles.progressFill,
-                  {
-                    width: `${Math.round(totalProgress * 100)}%`,
-                    backgroundColor:
-                      totalProgress === 1 ? theme.colors.statusSuccess : theme.colors.accent,
-                  },
-                ]}
-              />
-            </View>
+            <ProgressBar theme={theme} done={totalItems - totalOpen} total={totalItems} />
           ) : null}
         </View>
 
-        {todos.error ? (
-          <Text style={{ color: theme.colors.statusDanger }}>{todos.error.message}</Text>
-        ) : null}
-
         {data ? (
-          <>
-            {showGlobalSection ? (
-              <TodoSection file={data.global} theme={theme} actions={todos} />
-            ) : null}
-            {visibleProjects.map((file) => (
-              <TodoSection
-                key={file.projectId}
-                file={file}
-                theme={theme}
-                actions={todos}
-                onOpenWorkspace={
-                  file.workspaceId && navigation?.openWorkspace
-                    ? () => navigation.openWorkspace({ workspaceId: file.workspaceId! })
-                    : undefined
-                }
-              />
-            ))}
-            {!showGlobalSection && visibleProjects.length === 0 ? (
-              <View
-                style={[
-                  styles.emptyCard,
-                  { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
-                ]}
-              >
-                <Text style={[styles.emptyText, { color: theme.colors.foregroundMuted }]}>
-                  No todos yet — choose a project below to add one.
-                </Text>
-              </View>
-            ) : null}
-          </>
-        ) : (
+          visibleFiles.length > 0 ? (
+            visibleFiles.map((file) => {
+              const workspaceId = file.workspaceId;
+              return (
+                <TodoSection
+                  key={file.projectId ?? "global"}
+                  file={file}
+                  theme={theme}
+                  todos={todos}
+                  onOpenWorkspace={
+                    workspaceId && navigation
+                      ? () => navigation.openWorkspace({ workspaceId })
+                      : undefined
+                  }
+                />
+              );
+            })
+          ) : (
+            <EmptyCard theme={theme} text="No tasks here — pick a target below to add one." />
+          )
+        ) : todos.error ? null : (
           <Text style={{ color: theme.colors.foregroundMuted }}>Loading…</Text>
         )}
       </ScrollView>
@@ -770,93 +648,99 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
       <TodoBottomComposer
         theme={theme}
         compact={layout.compact}
-        projectId={effectiveProjectId}
-        targetLabel={activeTargetLabel}
-        targets={composerTargets}
-        onSelectProject={setTargetProjectId}
+        target={target}
+        targets={data ? files : [GLOBAL_TARGET]}
+        onSelectTarget={setTargetProjectId}
         onAdd={todos.add}
+        error={todos.error}
       />
     </View>
   );
 }
 
+/** The Explorer list: the workspace's project, or the global list for a workspace rooted at `~`. */
+function workspaceFile(data: TodoListData, projectId: string, rootPath: string): TodoFile | null {
+  const project = data.projects.find((file) => file.projectId === projectId);
+  if (project) return project;
+  const homeDir = data.global.path.replace(/[\\/]TODO\.md$/, "");
+  return rootPath.replace(/[\\/]+$/, "") === homeDir ? data.global : null;
+}
+
 export function WorkspaceTodosPanel({ theme, workspaceId }: PluginWorkspacePanelProps) {
   const todos = useTodos();
-  const snapshot = useWorkspace(workspaceId, (workspace) => ({
-    projectId: workspace.projectId,
-    projectName: workspace.projectDisplayName,
-    projectRootPath: workspace.projectRootPath,
+  const workspace = useWorkspace(workspaceId, (snapshot) => ({
+    projectId: snapshot.projectId,
+    projectRootPath: snapshot.projectRootPath,
   }));
-
-  const data = todos.data;
-  const matchedProject = data?.projects.find((item) => item.projectId === snapshot?.projectId);
-  const isGlobalRoot =
-    Boolean(snapshot && data && `${snapshot.projectRootPath}/TODO.md` === data.global.path);
-
-  const file: TodoFile | null =
-    matchedProject ??
-    (isGlobalRoot && data
-      ? data.global
-      : data && snapshot
-        ? {
-            projectId: snapshot.projectId,
-            workspaceId,
-            label: snapshot.projectName,
-            path: `${snapshot.projectRootPath}/TODO.md`,
-            items: [],
-          }
-        : null);
+  const file =
+    todos.data && workspace
+      ? workspaceFile(todos.data, workspace.projectId, workspace.projectRootPath)
+      : null;
 
   if (!file) {
     return (
-      <View style={{ flex: 1, padding: 16, backgroundColor: theme.colors.surface0 }}>
-        <Text style={{ color: theme.colors.foregroundMuted }}>
-          {todos.error ? todos.error.message : "Loading…"}
+      <View style={[styles.fill, styles.panelMessage, { backgroundColor: theme.colors.surface0 }]}>
+        <Text style={{ color: todos.error ? theme.colors.statusDanger : theme.colors.foregroundMuted }}>
+          {todos.error ?? (todos.data ? "This workspace has no project TODO list." : "Loading…")}
         </Text>
       </View>
     );
   }
 
   return (
-    <View style={{ flex: 1, backgroundColor: theme.colors.surface0 }}>
+    <View style={[styles.fill, { backgroundColor: theme.colors.surface0 }]}>
       <ScrollView
-        style={{ flex: 1 }}
-        contentContainerStyle={{ padding: 12, gap: 12 }}
+        style={styles.fill}
+        contentContainerStyle={styles.panelContent}
         keyboardShouldPersistTaps="handled"
       >
-        <TodoSection file={file} theme={theme} actions={todos} compactHeader />
+        <TodoSection key={file.path} file={file} theme={theme} todos={todos} compactHeader />
       </ScrollView>
       <TodoBottomComposer
         theme={theme}
         compact
-        projectId={file.projectId}
-        targetLabel={file.label}
+        target={file}
         onAdd={todos.add}
+        error={todos.error}
       />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  sidebarBadge: {
+  fill: {
+    flex: 1,
+  },
+  spacedRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  divider: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  badge: {
+    minWidth: 20,
     paddingHorizontal: 6,
     paddingVertical: 1,
     borderRadius: 999,
-    minWidth: 20,
     alignItems: "center",
     justifyContent: "center",
   },
-  sidebarBadgeText: {
+  badgeText: {
     fontSize: 11,
     fontWeight: "600",
+  },
+  screenContent: {
+    gap: 22,
+    width: "100%",
+    maxWidth: 720,
+    alignSelf: "center",
   },
   screenHeader: {
     gap: 10,
   },
   screenTopRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
     flexWrap: "wrap",
     gap: 10,
   },
@@ -896,17 +780,18 @@ const styles = StyleSheet.create({
     height: "100%",
     borderRadius: 999,
   },
+  panelContent: {
+    padding: 12,
+  },
+  panelMessage: {
+    padding: 16,
+  },
   section: {
     gap: 8,
   },
   compactHeader: {
     gap: 6,
     paddingHorizontal: 2,
-  },
-  compactMetaRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
   },
   compactStatus: {
     fontSize: 12,
@@ -921,7 +806,7 @@ const styles = StyleSheet.create({
     gap: 10,
     paddingHorizontal: 2,
   },
-  sectionIconWrap: {
+  sectionIcon: {
     width: 28,
     height: 28,
     borderRadius: 7,
@@ -935,27 +820,9 @@ const styles = StyleSheet.create({
   sectionTitle: {
     fontSize: 14,
     fontWeight: "600",
-    flexShrink: 1,
   },
   sectionPath: {
     fontSize: 11,
-  },
-  sectionRight: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-  },
-  countBadge: {
-    minWidth: 22,
-    paddingHorizontal: 7,
-    paddingVertical: 2,
-    borderRadius: 999,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  countBadgeText: {
-    fontSize: 11,
-    fontWeight: "600",
   },
   openWorkspaceButton: {
     width: 24,
@@ -1009,15 +876,11 @@ const styles = StyleSheet.create({
   deleteButton: {
     width: 22,
     height: 22,
-    borderRadius: 5,
     alignItems: "center",
     justifyContent: "center",
     opacity: 0.7,
   },
   completedBar: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
     paddingHorizontal: 12,
     paddingVertical: 7,
   },
@@ -1026,11 +889,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 5,
   },
-  completedLabel: {
-    fontSize: 11.5,
-    fontWeight: "500",
-  },
-  clearText: {
+  completedText: {
     fontSize: 11.5,
     fontWeight: "500",
   },
@@ -1043,7 +902,7 @@ const styles = StyleSheet.create({
     alignSelf: "center",
     gap: 8,
   },
-  targetSelectorRow: {
+  targetRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: 6,
@@ -1072,18 +931,12 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     borderWidth: 1,
   },
-  plusSlot: {
-    width: 18,
-    height: 18,
-    alignItems: "center",
-    justifyContent: "center",
-  },
   composerInput: {
     flex: 1,
     fontSize: 13.5,
     paddingVertical: 2,
   },
-  submitPill: {
+  submitButton: {
     width: 28,
     height: 26,
     borderRadius: 7,

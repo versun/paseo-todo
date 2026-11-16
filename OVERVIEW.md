@@ -1,10 +1,7 @@
-TODO keeps task lists in plain `TODO.md` files next to your work.
+TODO keeps task lists in plain Markdown `TODO.md` files: one global list in `~/TODO.md` and one per project in `<project root>/TODO.md`, on the daemon machine.
 
-It adds a TODO screen to the sidebar, a TODO tab to the Explorer panel, Command Center actions, and a `/todo` slash command. The screen shows the global list and one section per active workspace, so every list is visible in one place. The Explorer tab shows the current workspace only. Running `/todo [task]` in the composer adds a task to the current workspace when text is provided and opens the TODO tab in Explorer. Both views use the same rows and add field, and both refresh every couple of seconds.
+The TODO screen (sidebar) shows every list that has tasks, filtered by All, Global, or Projects, with overall progress. Add tasks from the field at the bottom; pick its target with the chips above it (Global by default, or any project, even one with no tasks yet). The Explorer TODO tab shows the current workspace's project list. `/todo [task]` adds a task to the current workspace's project and opens that tab. Command Center has actions for both views.
 
-Items are Markdown checkboxes (`- [ ] task`). Press a row to check it off. New todos from the
-global section are appended to `~/TODO.md` on the daemon machine; each workspace section appends
-to `TODO.md` in that workspace's directory. Files are created on first add. The plugin reads and
-writes only those files.
+Items are Markdown checkboxes (`- [ ] task`). Press a row to check it off, use × to delete it, and Clear to remove the completed tasks of a list. Completed tasks are collapsed under each list. Views refresh every couple of seconds.
 
-Workspaces that are archived or background are not listed.
+A `TODO.md` file is created on the first add; checking off, deleting, and clearing never create one. Edits keep the file's other lines and line endings intact. If a task changed on disk since the view last refreshed, checking it off or deleting it is refused so the wrong task is never changed; Clear removes every task that is completed on disk. The plugin reads and writes only these files. A workspace rooted at `~` uses the Global list; projects rooted at `~/.paseo` have no list.

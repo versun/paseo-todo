@@ -39,10 +39,12 @@ export default function contribute(client: PluginClientContext) {
     context: "workspace",
     async onSubmit({ args, workspace, rpc, openPanel }) {
       const text = args.trim();
-      if (text) {
-        await rpc(addTodo, { projectId: workspace.projectId, text });
+      // Open the panel even when the add fails; the error still propagates.
+      try {
+        if (text) await rpc(addTodo, { projectId: workspace.projectId, text });
+      } finally {
+        openPanel("todos", { location: "explorer" });
       }
-      openPanel("todos", { location: "explorer" });
     },
   });
   return () => {};
