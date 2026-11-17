@@ -748,11 +748,10 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
   const { data } = todos;
 
   const files = data ? [data.global, ...data.projects] : [];
-  // Only groups with tasks are shown; the composer can still target any project.
+  // Every list is shown, including projects with no TODO.md yet — their
+  // section still offers the add input, and the first add creates the file.
   const visibleFiles = files.filter(
-    (file) =>
-      file.items.length > 0 &&
-      (filter === "all" || (file.projectId === null) === (filter === "global")),
+    (file) => filter === "all" || (file.projectId === null) === (filter === "global"),
   );
   const totalOpen = openCount(files);
   const totalItems = files.reduce((sum, file) => sum + file.items.length, 0);
@@ -844,7 +843,7 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
               );
             })
           ) : (
-            <EmptyCard theme={theme} text="No tasks here — pick a target below to add one." />
+            <EmptyCard theme={theme} text="No lists yet — add a task below to create one." />
           )
         ) : todos.error ? null : (
           <Text style={{ color: theme.colors.foregroundMuted }}>Loading…</Text>
