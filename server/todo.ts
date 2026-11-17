@@ -138,6 +138,13 @@ function isNoteLine(text: string): boolean {
   return /^\s/.test(text) && !CHECKBOX.test(text);
 }
 
+/** The line after the note block that belongs to the task on line `line`. */
+function noteBlockEnd(lines: Line[], line: number): number {
+  let end = line + 1;
+  while (end < lines.length && isNoteLine(lines[end].text)) end++;
+  return end;
+}
+
 /**
  * The note text of an indented line. Checkbox-shaped notes are written with a
  * zero-width space after the indent (see noteTodoHandler); it is not
@@ -272,22 +279,13 @@ export async function listTodosHandler(
   type FileItems = { items: TodoItem[]; error?: string };
   const reads = new Map<string, Promise<FileItems>>();
   const loadItems = (path: string): Promise<FileItems> => {
-    const cached = reads.get(path);
-    if (cached) return cached;
-    const pending = (async () => {
-      // Paths aliasing one file (e.g. a symlinked project root) share the read.
-      const key = await realpath(path).catch(() => path);
-      if (key !== path) {
-        const shared = reads.get(key);
-        if (shared) return shared;
-      }
-      const result = readText(path)
+    let pending = reads.get(path);
+    if (!pending) {
+      pending = readText(path)
         .then((source): FileItems => ({ items: parseItems(source) }))
         .catch((error: unknown): FileItems => ({ items: [], error: messageOf(error) }));
-      if (key !== path) reads.set(key, result);
-      return result;
-    })();
-    reads.set(path, pending);
+      reads.set(path, pending);
+    }
     return pending;
   };
 
@@ -400,8 +398,7 @@ export async function noteTodoHandler(
   return mutateTodoFile(paseo, projectId, (existing) => {
     const lines = splitLines(existing);
     const { line } = locateLine(lines, index, text);
-    let end = line + 1;
-    while (end < lines.length && isNoteLine(lines[end].text)) end++;
+    const end = noteBlockEnd(lines, line);
     const current = lines
       .slice(line + 1, end)
       .map((entry) => noteText(entry.text))
@@ -439,19 +436,9 @@ export async function removeTodoHandler(
 ) {
   return mutateTodoFile(paseo, projectId, (existing) => {
     const lines = splitLines(existing);
-    // Without `index`, clear every completed item; a no-op leaves the file alone.
-    const target = index === undefined ? null : locateLine(lines, index, text ?? "").line;
-    const drop = new Set<number>();
-    for (let i = 0; i < lines.length; i++) {
-      const match = CHECKBOX.exec(lines[i].text);
-      const removing = target !== null ? i === target : match !== null && match[2] !== " ";
-      if (!removing) continue;
-      drop.add(i);
-      // A removed task takes the indented note lines under it along.
-      let j = i + 1;
-      while (j < lines.length && isNoteLine(lines[j].text)) drop.add(j++);
-    }
-    const next = lines.filter((_, lineIndex) => !drop.has(lineIndex));
-    return next.length === lines.length ? null : joinLines(next);
+    const { line } = locateLine(lines, index, text);
+    // A removed task takes the indented note lines under it along.
+    lines.splice(line, noteBlockEnd(lines, line) - line);
+    return joinLines(lines);
   });
 }

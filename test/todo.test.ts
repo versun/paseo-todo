@@ -125,7 +125,7 @@ const toggle = (index: number, text: string) =>
   server.toggleTodoHandler({ projectId: P, index, text }, ctx);
 const edit = (index: number, text: string, newText: string) =>
   server.editTodoHandler({ projectId: P, index, text, newText }, ctx);
-const remove = (index?: number, text?: string) =>
+const remove = (index: number, text: string) =>
   server.removeTodoHandler({ projectId: P, index, text }, ctx);
 const setNote = (index: number, text: string, note: string) =>
   server.noteTodoHandler({ projectId: P, index, text, note }, ctx);
@@ -167,12 +167,6 @@ describe("line endings", () => {
     writeFileSync(FILE, "- [ ] a\r");
     await add("b");
     assert.deepEqual((await itemsOf()).map((item) => item.text), ["a", "b"]);
-  });
-
-  test("clear completed keeps CRLF", async () => {
-    writeFileSync(FILE, "- [x] a\r\n- [ ] b\r\n- [x] c\r\n");
-    await remove();
-    assert.equal(read(), "- [ ] b\r\n");
   });
 
   test("add to an unterminated file inserts a separator", async () => {
@@ -260,12 +254,6 @@ describe("note", () => {
     assert.equal(read(), "- [ ] beta\n");
   });
 
-  test("clear completed drops notes under completed tasks only", async () => {
-    writeFileSync(FILE, "- [x] a\n  note a\n- [ ] b\n  note b\n");
-    await remove();
-    assert.equal(read(), "- [ ] b\n  note b\n");
-  });
-
   test("a checkbox-shaped note line stays a note and never becomes a task", async () => {
     writeFileSync(FILE, "- [ ] alpha\n- [ ] beta\n");
     await setNote(0, "alpha", "- [ ] check CI");
@@ -342,18 +330,9 @@ describe("stale-index guard", () => {
     await assert.rejects(toggle(5, "a"), /changed on disk/);
   });
 
-  test("clear completed without done items leaves the file untouched", async () => {
-    writeFileSync(FILE, "- [ ] a\n");
-    const before = statSync(FILE).ino;
-    await remove();
-    assert.equal(statSync(FILE).ino, before);
-    assert.equal(read(), "- [ ] a\n");
-  });
-
   test("toggle/remove never create a missing file", async () => {
     await assert.rejects(toggle(0, "a"), /changed on disk/);
     await assert.rejects(remove(0, "a"), /changed on disk/);
-    await remove();
     assert.equal(existsSync(FILE), false);
   });
 });

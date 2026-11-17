@@ -118,17 +118,11 @@ export const noteTodo = defineRpc({
 
 export const removeTodo = defineRpc({
   name: "todo.remove",
-  input: z
-    .object({
-      projectId: z.string().nullable(),
-      /** Omit `index` to clear all completed items in the target file. */
-      index: z.number().int().nonnegative().optional(),
-      /** Required with `index`: the item text the client last saw. */
-      text: z.string().optional(),
-    })
-    .refine((value) => value.index === undefined || value.text !== undefined, {
-      message: "text is required when index is provided",
-      path: ["text"],
-    }),
+  input: z.object({
+    projectId: z.string().nullable(),
+    index: z.number().int().nonnegative(),
+    /** The item text the client last saw; mismatches are refused like toggle/edit. */
+    text: z.string(),
+  }),
   output: z.object({ ok: z.boolean() }),
 });

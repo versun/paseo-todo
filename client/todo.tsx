@@ -198,8 +198,7 @@ function useTodos() {
   );
   const remove = useTodoMutation(
     removeRpc,
-    (items, { index }) =>
-      items.filter((item) => (index === undefined ? !item.done : item.index !== index)),
+    (items, { index }) => items.filter((item) => item.index !== index),
     setActionError,
   );
 
@@ -308,23 +307,23 @@ function TodoRow({
   const noteInputRef = useRef<NativeTextInput>(null);
   const expandAnim = useRef(new Animated.Value(0)).current;
 
-  // A text prop that differs from our own optimistic commit came from
-  // elsewhere (a poll), so it replaces the draft; an echo of the commit leaves
-  // an in-progress draft alone.
-  if (item.text !== prevPropText.current) {
-    const externalChange = item.text !== currentText.current;
+  // Props that differ from what this row last saw come from a poll, or from
+  // this row's own optimistic commit echoing back. While a draft is dirty we
+  // keep it and keep the stale guard text: rows are keyed by index, so a row
+  // whose props changed may now be a different task, and the server must
+  // refuse the commit rather than rename the wrong one.
+  if (item.text !== prevPropText.current || item.note !== prevPropNote.current) {
     prevPropText.current = item.text;
-    currentText.current = item.text;
-    if (externalChange) setDraft(item.text);
-  }
-  // Same guard for the note: a clobbered draft is only safe when the user has
-  // no unsaved note edits, so a poll never wipes out an in-progress note.
-  if (item.note !== prevPropNote.current) {
-    const externalChange = item.note !== currentNote.current;
-    const draftClean = normalizeNoteText(draftNote) === currentNote.current;
     prevPropNote.current = item.note;
-    currentNote.current = item.note;
-    if (externalChange && draftClean) setDraftNote(item.note);
+    const dirty =
+      normalizeTaskText(draft) !== currentText.current ||
+      normalizeNoteText(draftNote) !== currentNote.current;
+    if (!dirty) {
+      currentText.current = item.text;
+      currentNote.current = item.note;
+      setDraft(item.text);
+      setDraftNote(item.note);
+    }
   }
 
   // Never let an unmount blur (e.g. a removed row or filter switch) fire a stale edit.
@@ -563,6 +562,34 @@ function TodoRow({
   );
 }
 
+/** Rows for one file; `last` marks whether the final row ends the card (no divider). */
+function TodoRows({
+  items,
+  file,
+  theme,
+  todos,
+  last,
+}: {
+  items: TodoItem[];
+  file: TodoFile;
+  theme: TodoTheme;
+  todos: TodoActions;
+  last: boolean;
+}) {
+  return items.map((item, idx) => (
+    <TodoRow
+      key={item.index}
+      item={item}
+      last={last && idx === items.length - 1}
+      theme={theme}
+      onToggle={(text) => todos.toggle(file, item.index, text)}
+      onEdit={(text, newText) => todos.edit(file, item.index, text, newText)}
+      onSetNote={(text, note) => todos.setNote(file, item.index, text, note)}
+      onRemove={(text) => todos.remove(file, item.index, text)}
+    />
+  ));
+}
+
 function TodoSection({
   file,
   theme,
@@ -581,19 +608,6 @@ function TodoSection({
   const doneItems = file.items.filter((item) => item.done);
   const total = file.items.length;
   const isGlobal = file.projectId === null;
-
-  const renderRow = (item: TodoItem, last: boolean) => (
-    <TodoRow
-      key={item.index}
-      item={item}
-      last={last}
-      theme={theme}
-      onToggle={(text) => todos.toggle(file, item.index, text)}
-      onEdit={(text, newText) => todos.edit(file, item.index, text, newText)}
-      onSetNote={(text, note) => todos.setNote(file, item.index, text, note)}
-      onRemove={(text) => todos.remove(file, item.index, text)}
-    />
-  );
 
   return (
     <View style={styles.section}>
@@ -671,9 +685,13 @@ function TodoSection({
             { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
           ]}
         >
-          {openItems.map((item, idx) =>
-            renderRow(item, idx === openItems.length - 1 && doneItems.length === 0),
-          )}
+          <TodoRows
+            items={openItems}
+            file={file}
+            theme={theme}
+            todos={todos}
+            last={doneItems.length === 0}
+          />
           {doneItems.length > 0 ? (
             <>
               <View
@@ -703,9 +721,9 @@ function TodoSection({
                   </Text>
                 </Pressable>
               </View>
-              {showDone
-                ? doneItems.map((item, idx) => renderRow(item, idx === doneItems.length - 1))
-                : null}
+              {showDone ? (
+                <TodoRows items={doneItems} file={file} theme={theme} todos={todos} last />
+              ) : null}
             </>
           ) : null}
         </View>
@@ -845,7 +863,7 @@ function TodoBottomComposer({
             onFocus={() => setFocused(true)}
             onBlur={() => setFocused(false)}
             onSubmitEditing={submit}
-            blurOnSubmit={false}
+            submitBehavior="submit"
             returnKeyType="done"
             placeholder={`Add to ${target.label}…`}
             placeholderTextColor={theme.colors.foregroundMuted}
@@ -1086,18 +1104,7 @@ function WorkspaceTodoPillPopover({
             { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
           ]}
         >
-          {openItems.map((item, idx) => (
-            <TodoRow
-              key={item.index}
-              item={item}
-              last={idx === openItems.length - 1}
-              theme={theme}
-              onToggle={(text) => todos.toggle(file, item.index, text)}
-              onEdit={(text, newText) => todos.edit(file, item.index, text, newText)}
-              onSetNote={(text, note) => todos.setNote(file, item.index, text, note)}
-              onRemove={(text) => todos.remove(file, item.index, text)}
-            />
-          ))}
+          <TodoRows items={openItems} file={file} theme={theme} todos={todos} last />
         </View>
       ) : null}
 
@@ -1251,11 +1258,10 @@ export function contributeComposerPills(client: PluginClientContext) {
 
   let workspaceSub: { release(): Promise<void> } | null = null;
   let workspaceRetry: ReturnType<typeof setTimeout> | null = null;
-  let includeBackground = true;
 
   const observeWorkspaces = () => {
     void client.paseo.workspaces
-      .list({ includeBackground, subscribe: {} })
+      .list({ includeBackground: true, subscribe: {} })
       .then(({ subscription }) => {
         if (stopped) {
           void subscription.release();
@@ -1294,12 +1300,6 @@ export function contributeComposerPills(client: PluginClientContext) {
       })
       .catch((error: unknown) => {
         if (stopped) return;
-        if (includeBackground) {
-          // Older daemons reject `includeBackground`; retry without it.
-          includeBackground = false;
-          observeWorkspaces();
-          return;
-        }
         console.error("[todo] workspace observation failed", error);
         // Transient failure (e.g. reconnecting): keep retrying so pills are
         // not permanently degraded to the `file.workspaceId` fallback.
