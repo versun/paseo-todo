@@ -129,6 +129,8 @@ const remove = (index: number, text: string) =>
   server.removeTodoHandler({ projectId: P, index, text }, ctx);
 const setNote = (index: number, text: string, note: string) =>
   server.noteTodoHandler({ projectId: P, index, text, note }, ctx);
+const move = (index: number, text: string, toIndex: number, from: string | null = P, to: string | null = P) =>
+  server.moveTodoHandler({ projectId: from, index, text, toProjectId: to, toIndex }, ctx);
 const itemsOf = async () => (await server.listTodosHandler({}, ctx)).projects[0].items;
 
 beforeEach(() => {
@@ -429,6 +431,123 @@ describe("atomic write", () => {
     await toggle(0, "a");
     await add("b");
     assert.deepEqual(readdirSync(ROOT), ["TODO.md"]);
+  });
+});
+
+describe("move within a file", () => {
+  test("reorders items and keeps text, state, notes and line endings", async () => {
+    writeFileSync(FILE, "# T\r\n- [ ] a\r\n  note a\r\n- [x] b\r\n- [ ] c\r\n");
+    await move(0, "a", 2); // insert before the item at pre-move index 2 ("c")
+    assert.equal(read(), "# T\r\n- [x] b\r\n- [ ] a\r\n  note a\r\n- [ ] c\r\n");
+  });
+
+  test("moves up, down, to the top and to the end", async () => {
+    writeFileSync(FILE, "- [ ] a\n- [ ] b\n- [ ] c\n");
+    await move(2, "c", 0);
+    assert.equal(read(), "- [ ] c\n- [ ] a\n- [ ] b\n");
+    await move(0, "c", 3);
+    assert.equal(read(), "- [ ] a\n- [ ] b\n- [ ] c\n");
+  });
+
+  test("moving onto itself is a no-op that does not touch the file", async () => {
+    writeFileSync(FILE, "- [ ] a\n- [ ] b\n");
+    const before = statSync(FILE).ino;
+    await move(1, "b", 1); // same spot
+    await move(1, "b", 2); // right after itself
+    assert.equal(statSync(FILE).ino, before);
+    assert.equal(read(), "- [ ] a\n- [ ] b\n");
+  });
+
+  test("a toIndex past the end appends at the end", async () => {
+    writeFileSync(FILE, "- [ ] a\n- [ ] b\n");
+    await move(0, "a", 99);
+    assert.equal(read(), "- [ ] b\n- [ ] a\n");
+  });
+
+  test("an unterminated last line moved into the middle does not glue lines", async () => {
+    writeFileSync(FILE, "- [ ] a\n- [ ] b");
+    await move(1, "b", 0);
+    assert.equal(read(), "- [ ] b\n- [ ] a\n");
+  });
+
+  test("appending after an unterminated last line still separates the tasks", async () => {
+    writeFileSync(FILE, "- [ ] a\n- [ ] b");
+    await move(0, "a", 2);
+    assert.equal(read(), "- [ ] b\n- [ ] a\n");
+  });
+
+  test("stale text is refused and the file is untouched", async () => {
+    writeFileSync(FILE, "- [ ] a\n- [ ] b\n");
+    await assert.rejects(move(0, "nope", 1), /changed on disk/);
+    assert.equal(read(), "- [ ] a\n- [ ] b\n");
+  });
+
+  test("inserts before the first checkbox, after heading lines", async () => {
+    writeFileSync(FILE, "# T\n\n- [ ] a\n- [ ] b\n");
+    await move(1, "b", 0);
+    assert.equal(read(), "# T\n\n- [ ] b\n- [ ] a\n");
+  });
+});
+
+describe("move between files", () => {
+  const ROOT2 = join(SANDBOX, "project2");
+  const FILE2 = join(ROOT2, "TODO.md");
+  const read2 = () => readFileSync(FILE2, "utf8");
+
+  const twoProjects = () => {
+    rmSync(ROOT2, { recursive: true, force: true });
+    mkdirSync(ROOT2, { recursive: true });
+    projects = [
+      { projectId: P, projectRootPath: ROOT, projectDisplayName: "P1" },
+      { projectId: "p2", projectRootPath: ROOT2, projectDisplayName: "P2" },
+    ];
+  };
+
+  test("moves the task with its note and done state into the other file", async () => {
+    twoProjects();
+    writeFileSync(FILE, "- [ ] a\n- [x] b\n  keep me\n- [ ] c\n");
+    writeFileSync(FILE2, "- [ ] z\n");
+    await move(1, "b", 1, P, "p2");
+    assert.equal(read(), "- [ ] a\n- [ ] c\n");
+    assert.equal(read2(), "- [ ] z\n- [x] b\n  keep me\n");
+  });
+
+  test("creates the destination TODO.md when missing", async () => {
+    twoProjects();
+    writeFileSync(FILE, "- [ ] a\n- [ ] b\n");
+    await move(0, "a", 0, P, "p2");
+    assert.equal(read(), "- [ ] b\n");
+    assert.equal(read2(), "- [ ] a\n");
+  });
+
+  test("appending to the global file works", async () => {
+    const globalFile = join(HOME, "TODO.md");
+    writeFileSync(FILE, "- [ ] a\n- [ ] b\n");
+    rmSync(globalFile, { force: true });
+    await move(1, "b", 5, P, null);
+    assert.equal(read(), "- [ ] a\n");
+    assert.equal(readFileSync(globalFile, "utf8"), "- [ ] b\n");
+    rmSync(globalFile, { force: true });
+  });
+
+  test("stale text writes neither file", async () => {
+    twoProjects();
+    writeFileSync(FILE, "- [ ] a\n");
+    writeFileSync(FILE2, "- [ ] z\n");
+    await assert.rejects(move(0, "nope", 0, P, "p2"), /changed on disk/);
+    assert.equal(read(), "- [ ] a\n");
+    assert.equal(read2(), "- [ ] z\n");
+  });
+
+  test("two project ids pointing at one file reorder inside it", async () => {
+    const alias = join(SANDBOX, "alias");
+    rmSync(alias, { force: true });
+    symlinkSync(ROOT, alias);
+    projects.push({ projectId: "p2", projectRootPath: alias, projectDisplayName: "P2" });
+    writeFileSync(FILE, "- [ ] a\n- [ ] b\n");
+    await move(0, "a", 2, P, "p2");
+    assert.equal(read(), "- [ ] b\n- [ ] a\n");
+    rmSync(alias);
   });
 });
 

@@ -9,6 +9,7 @@ import {
   editTodo,
   listTodos,
   messageOf,
+  moveTodo,
   normalizeNoteText,
   normalizeTaskText,
   noteTodo,
@@ -176,19 +177,24 @@ function parseItems(source: string): TodoItem[] {
   return items;
 }
 
+/** The physical line of item `itemIndex`, or `lines.length` when past the end. */
+function itemLine(lines: Line[], itemIndex: number): number {
+  let seen = 0;
+  for (let line = 0; line < lines.length; line++) {
+    if (CHECKBOX.test(lines[line].text) && seen++ === itemIndex) return line;
+  }
+  return lines.length;
+}
+
 /**
  * Find the physical line of item `index`, refusing to act when that item no
  * longer has the text the client saw (the file changed since its last poll).
  */
 function locateLine(lines: Line[], index: number, text: string) {
-  let seen = 0;
-  for (let line = 0; line < lines.length; line++) {
-    const match = CHECKBOX.exec(lines[line].text);
-    if (!match || seen++ !== index) continue;
-    if (match[4].trim() !== text) break;
-    return { line, match };
-  }
-  throw new Error(STALE_TASK);
+  const line = itemLine(lines, index);
+  const match = line < lines.length ? CHECKBOX.exec(lines[line].text) : null;
+  if (!match || match[4].trim() !== text) throw new Error(STALE_TASK);
+  return { line, match };
 }
 
 /** The file's most common line ending; `\n` when there are none yet. */
@@ -241,20 +247,24 @@ async function resolvePath(paseo: PaseoApi, projectId: string | null): Promise<s
  */
 let mutationQueue: Promise<unknown> = Promise.resolve();
 
+function queueMutation<T>(job: () => Promise<T>): Promise<T> {
+  const run = mutationQueue.then(job);
+  mutationQueue = run.catch(() => {});
+  return run;
+}
+
 /** `transform` returns the new content, or `null` to leave the file untouched. */
 function mutateTodoFile(
   paseo: PaseoApi,
   projectId: string | null,
   transform: (existing: string) => string | null,
 ): Promise<{ ok: boolean }> {
-  const run = mutationQueue.then(async () => {
+  return queueMutation(async () => {
     const path = await resolvePath(paseo, projectId);
     const next = transform(await readText(path));
     if (next !== null) await writeText(path, next);
     return { ok: true };
   });
-  mutationQueue = run.catch(() => {});
-  return run;
 }
 
 export async function listTodosHandler(
@@ -440,5 +450,85 @@ export async function removeTodoHandler(
     // A removed task takes the indented note lines under it along.
     lines.splice(line, noteBlockEnd(lines, line) - line);
     return joinLines(lines);
+  });
+}
+
+/**
+ * Splice a moved block (task line + its note lines) into `lines` so its task
+ * lands before the item at `itemIndex` (`>=` the item count appends). Line
+ * endings are repaired at the seams: an unterminated neighbor gets the file's
+ * dominant ending, and a moved block that was the file's unterminated tail
+ * gets one too when it no longer ends the file.
+ */
+function insertBlock(lines: Line[], block: Line[], itemIndex: number): void {
+  const position = itemLine(lines, itemIndex);
+  if (position >= lines.length) {
+    const previous = lines[lines.length - 1];
+    if (previous && !previous.eol) previous.eol = dominantEol(lines);
+    lines.push(...block);
+    // A block filling an empty file still ends with a newline, like addTodo.
+    if (lines.length === block.length) {
+      const last = lines[lines.length - 1];
+      if (last && !last.eol) last.eol = dominantEol(lines);
+    }
+    return;
+  }
+  const last = block[block.length - 1];
+  if (!last.eol) last.eol = dominantEol(lines);
+  lines.splice(position, 0, ...block);
+}
+
+/** Reorder inside one file; `toIndex` counts items before the removal. */
+function moveWithin(
+  existing: string,
+  index: number,
+  text: string,
+  toIndex: number,
+): string | null {
+  const lines = splitLines(existing);
+  const { line } = locateLine(lines, index, text);
+  const total = lines.reduce((count, { text: lineText }) => count + (CHECKBOX.test(lineText) ? 1 : 0), 0);
+  const at = Math.min(toIndex, total);
+  const landing = at > index ? at - 1 : at;
+  if (landing === index) return null; // Already there.
+  const block = lines.splice(line, noteBlockEnd(lines, line) - line);
+  insertBlock(lines, block, landing);
+  return joinLines(lines);
+}
+
+export async function moveTodoHandler(
+  { projectId, index, text, toProjectId, toIndex }: RpcInput<typeof moveTodo>,
+  { paseo }: PluginHandlerContext,
+) {
+  return queueMutation(async () => {
+    const [fromPath, toPath] = await Promise.all([
+      resolvePath(paseo, projectId),
+      resolvePath(paseo, toProjectId),
+    ]);
+    // Canonicalize the directory, not the file: realpath of a not-yet-created
+    // TODO.md would fail and hide that two project roots alias one directory.
+    const canonicalFile = async (path: string) =>
+      join(await canonicalDir(dirname(path)), basename(path));
+    const [fromCanonical, toCanonical] = await Promise.all([
+      canonicalFile(fromPath),
+      canonicalFile(toPath),
+    ]);
+    if (fromCanonical === toCanonical) {
+      // Same file (possibly via project ids aliasing one path): plain reorder.
+      const next = moveWithin(await readText(fromPath), index, text, toIndex);
+      if (next !== null) await writeText(fromPath, next);
+      return { ok: true };
+    }
+    const [source, target] = await Promise.all([readText(fromPath), readText(toPath)]);
+    const lines = splitLines(source);
+    const { line } = locateLine(lines, index, text);
+    const block = lines.splice(line, noteBlockEnd(lines, line) - line);
+    const targetLines = splitLines(target);
+    insertBlock(targetLines, block, toIndex);
+    // Write the destination first: a crash between the two writes leaves the
+    // task duplicated, never lost.
+    await writeText(toPath, joinLines(targetLines));
+    await writeText(fromPath, joinLines(lines));
+    return { ok: true };
   });
 }

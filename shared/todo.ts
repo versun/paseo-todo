@@ -126,3 +126,22 @@ export const removeTodo = defineRpc({
   }),
   output: z.object({ ok: z.boolean() }),
 });
+
+/**
+ * Moves the item at `index` so it lands before the item at `toIndex` in the
+ * destination list (pre-move numbering; `toIndex === items.length` appends).
+ * Works within one file and across files; the task keeps its done state and
+ * its indented note block. `text` is the same stale-index guard used by the
+ * other mutations, checked against the item being moved.
+ */
+export const moveTodo = defineRpc({
+  name: "todo.move",
+  input: z.object({
+    projectId: z.string().nullable(),
+    index: z.number().int().nonnegative(),
+    text: z.string(),
+    toProjectId: z.string().nullable(),
+    toIndex: z.number().int().nonnegative(),
+  }),
+  output: z.object({ ok: z.boolean() }),
+});

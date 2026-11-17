@@ -8,8 +8,24 @@ import type {
 } from "@getpaseo/plugin/client";
 import { useRpc, useWorkspace } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, SidebarRow, TextInput } from "@getpaseo/plugin/client/ui";
-import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useIsMutating,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   Animated,
   Easing,
@@ -27,6 +43,7 @@ import {
   editTodo,
   listTodos,
   messageOf,
+  moveTodo,
   normalizeNoteText,
   normalizeTaskText,
   noteTodo,
@@ -78,6 +95,29 @@ function openCount(files: TodoFile[]) {
   return files.reduce((sum, file) => sum + file.items.filter((item) => !item.done).length, 0);
 }
 
+/** The file a projectId writes to: the global file for `null` and `~` roots. */
+function pathFor(data: TodoListData, projectId: string | null): string | undefined {
+  return projectId === null
+    ? data.global.path
+    : (data.projects.find((file) => file.projectId === projectId)?.path ??
+        // Projects rooted at `~` (even via symlink) are not listed; their file
+        // is the global one.
+        (data.homeProjectIds.includes(projectId) ? data.global.path : undefined));
+}
+
+/** Returns `data` itself when no file changed, so no-ops keep query identity. */
+function mapFiles(
+  data: TodoListData,
+  apply: (file: TodoFile) => TodoFile,
+): TodoListData {
+  const global = apply(data.global);
+  const projects = data.projects.map(apply);
+  if (global === data.global && projects.every((file, i) => file === data.projects[i])) {
+    return data;
+  }
+  return { ...data, global, projects };
+}
+
 /** Apply an optimistic edit to the target file, and to any project sharing its path. */
 function updateFile(
   data: TodoListData | undefined,
@@ -85,24 +125,80 @@ function updateFile(
   updater: (items: TodoItem[]) => TodoItem[],
 ): TodoListData | undefined {
   if (!data) return data;
-  const path =
-    projectId === null
-      ? data.global.path
-      : (data.projects.find((file) => file.projectId === projectId)?.path ??
-        // Projects rooted at `~` (even via symlink) are not listed; their file
-        // is the global one.
-        (data.homeProjectIds.includes(projectId) ? data.global.path : undefined));
+  const path = pathFor(data, projectId);
   if (!path) return data;
-  const apply = (file: TodoFile): TodoFile =>
-    file.path === path
-      ? { ...file, items: updater(file.items).map((item, index) => ({ ...item, index })) }
-      : file;
-  return { ...data, global: apply(data.global), projects: data.projects.map(apply) };
+  return mapFiles(data, (file) => {
+    if (file.path !== path) return file;
+    const items = updater(file.items);
+    if (items === file.items) return file;
+    return { ...file, items: items.map((item, index) => ({ ...item, index })) };
+  });
+}
+
+/**
+ * Optimistic counterpart of `todo.move`: relocate the item between two files
+ * (or reorder inside one), mirroring the server's index adjustment and
+ * clamping. No-ops and missing items leave the data untouched.
+ */
+function moveInData(
+  data: TodoListData | undefined,
+  input: { projectId: string | null; index: number; toProjectId: string | null; toIndex: number },
+): TodoListData | undefined {
+  if (!data) return data;
+  const fromPath = pathFor(data, input.projectId);
+  const toPath = pathFor(data, input.toProjectId);
+  if (!fromPath || !toPath) return data;
+  if (fromPath === toPath) {
+    return updateFile(data, input.projectId, (items) => {
+      const item = items.find((entry) => entry.index === input.index);
+      if (!item) return items;
+      const at = input.toIndex > input.index ? input.toIndex - 1 : input.toIndex;
+      if (at === input.index) return items;
+      const rest = items.filter((entry) => entry.index !== input.index);
+      rest.splice(Math.min(Math.max(at, 0), rest.length), 0, item);
+      return rest;
+    });
+  }
+  const source = [data.global, ...data.projects].find((file) => file.path === fromPath);
+  const moved = source?.items.find((item) => item.index === input.index);
+  if (!moved) return data;
+  return mapFiles(data, (file) => {
+    if (file.path === fromPath) {
+      return {
+        ...file,
+        items: file.items
+          .filter((item) => item.index !== input.index)
+          .map((item, index) => ({ ...item, index })),
+      };
+    }
+    if (file.path === toPath) {
+      const items = [...file.items];
+      items.splice(Math.min(Math.max(input.toIndex, 0), items.length), 0, moved);
+      return { ...file, items: items.map((item, index) => ({ ...item, index })) };
+    }
+    return file;
+  });
+}
+
+/**
+ * The QueryClient of any mounted surface, captured so the pill-side poll can
+ * write fresh data into the shared cache (otherwise an open surface would
+ * show stale rows until its own tick after e.g. a `/todo` add).
+ */
+let todoQueryClient: QueryClient | null = null;
+
+/** Mirror the latest render value into a ref, for callbacks fired later. */
+function useLatest<T>(value: T) {
+  const ref = useRef(value);
+  ref.current = value;
+  return ref;
 }
 
 /** Polling pauses while a mutation is in flight so a poll cannot revert an optimistic edit. */
 function useTodoList() {
   const list = useRpc(listTodos);
+  const queryClient = useQueryClient();
+  todoQueryClient = queryClient;
   const mutating = useIsMutating({ mutationKey: MUTATION_KEY }) > 0;
   return useQuery({
     queryKey: LIST_KEY,
@@ -110,17 +206,23 @@ function useTodoList() {
       lastFetchAt = Date.now();
       const epoch = mutationEpoch;
       const data = await list({});
-      if (activeMutations === 0 && epoch === mutationEpoch) publishTodoData(data);
-      return data;
+      if (activeMutations === 0 && epoch === mutationEpoch) {
+        publishTodoData(data);
+        return data;
+      }
+      // A mutation began after this fetch started: its optimistic state is
+      // newer than this response, so keep it and let the settle-invalidation
+      // refetch the truth.
+      return latestTodoData ?? data;
     },
     initialData: () => latestTodoData,
     refetchInterval: mutating ? false : POLL_MS,
   });
 }
 
-function useTodoMutation<Input extends { projectId: string | null }>(
+function useTodoMutation<Input>(
   mutationFn: (input: Input) => Promise<unknown>,
-  optimistic: (items: TodoItem[], input: Input) => TodoItem[],
+  optimistic: (data: TodoListData | undefined, input: Input) => TodoListData | undefined,
   setError: (error: string | null) => void,
 ) {
   const queryClient = useQueryClient();
@@ -132,29 +234,25 @@ function useTodoMutation<Input extends { projectId: string | null }>(
       mutationEpoch += 1;
       await queryClient.cancelQueries({ queryKey: LIST_KEY });
       queryClient.setQueryData<TodoListData>(LIST_KEY, (prev) => {
-        const next = updateFile(prev, input.projectId, (items) => optimistic(items, input));
+        const next = optimistic(prev, input);
         if (next && next !== prev) publishTodoData(next);
         return next;
       });
     },
     onSuccess: () => setError(null),
     onError: (cause) => setError(messageOf(cause)),
-    // Refetch only after the last overlapping mutation; an earlier refetch would
-    // flash back the optimistic edits still in flight. A failed edit is undone here.
+    // Refetch only after the last overlapping mutation (this one still counts
+    // as pending inside onSettled); an earlier refetch would flash back the
+    // optimistic edits still in flight. A failed edit is undone here.
     onSettled: () => {
       activeMutations = Math.max(0, activeMutations - 1);
-      if (queryClient.isMutating({ mutationKey: MUTATION_KEY }) === 1) {
-        const promise = queryClient.invalidateQueries({ queryKey: LIST_KEY });
-        // Invalidation only refetches when a mounted surface observes the list
-        // query; without one the pills would stay stale, so force the pill
-        // poll. When a surface is open its refetch publishes fresh data, so
-        // skip the duplicate RPC.
-        const observed =
-          (queryClient.getQueryCache().find({ queryKey: LIST_KEY })?.observers.length ?? 0) > 0;
-        if (!observed) recheckPills?.();
-        return promise;
-      }
-      return undefined;
+      if (queryClient.isMutating({ mutationKey: MUTATION_KEY }) !== 1) return;
+      void queryClient.invalidateQueries({ queryKey: LIST_KEY });
+      // Invalidation only refetches when a mounted surface observes the list
+      // query; without one the pills would stay stale, so force the pill poll.
+      const observed =
+        (queryClient.getQueryCache().find({ queryKey: LIST_KEY })?.observers.length ?? 0) > 0;
+      if (!observed) recheckPills?.();
     },
   });
 }
@@ -167,38 +265,52 @@ function useTodos() {
   const editRpc = useRpc(editTodo);
   const noteRpc = useRpc(noteTodo);
   const removeRpc = useRpc(removeTodo);
+  const moveRpc = useRpc(moveTodo);
 
   const add = useTodoMutation(
     addRpc,
-    (items, { text }) => [
-      ...items,
-      { index: items.length, text: normalizeTaskText(text), done: false, note: "" },
-    ],
+    (data, { projectId, text }) =>
+      updateFile(data, projectId, (items) => [
+        ...items,
+        { index: items.length, text: normalizeTaskText(text), done: false, note: "" },
+      ]),
     setActionError,
   );
   const toggle = useTodoMutation(
     toggleRpc,
-    (items, { index }) =>
-      items.map((item) => (item.index === index ? { ...item, done: !item.done } : item)),
+    (data, { projectId, index }) =>
+      updateFile(data, projectId, (items) =>
+        items.map((item) => (item.index === index ? { ...item, done: !item.done } : item)),
+      ),
     setActionError,
   );
   const edit = useTodoMutation(
     editRpc,
-    (items, { index, newText }) =>
-      items.map((item) =>
-        item.index === index ? { ...item, text: normalizeTaskText(newText) } : item,
+    (data, { projectId, index, newText }) =>
+      updateFile(data, projectId, (items) =>
+        items.map((item) =>
+          item.index === index ? { ...item, text: normalizeTaskText(newText) } : item,
+        ),
       ),
     setActionError,
   );
   const setNote = useTodoMutation(
     noteRpc,
-    (items, { index, note }) =>
-      items.map((item) => (item.index === index ? { ...item, note } : item)),
+    (data, { projectId, index, note }) =>
+      updateFile(data, projectId, (items) =>
+        items.map((item) => (item.index === index ? { ...item, note } : item)),
+      ),
     setActionError,
   );
   const remove = useTodoMutation(
     removeRpc,
-    (items, { index }) => items.filter((item) => item.index !== index),
+    (data, { projectId, index }) =>
+      updateFile(data, projectId, (items) => items.filter((item) => item.index !== index)),
+    setActionError,
+  );
+  const move = useTodoMutation(
+    moveRpc,
+    (data, input) => moveInData(data, input),
     setActionError,
   );
 
@@ -225,10 +337,274 @@ function useTodos() {
       }),
     remove: (file: TodoFile, index: number, text: string) =>
       remove.mutate({ projectId: file.projectId, index, text }),
+    move: (from: TodoFile, index: number, text: string, to: TodoFile, toIndex: number) =>
+      move.mutate({ projectId: from.projectId, index, text, toProjectId: to.projectId, toIndex }),
   };
 }
 
 type TodoActions = ReturnType<typeof useTodos>;
+
+type DragGroup = "open" | "done";
+
+/** A measured drop area: a single item row, or a section's whole card ("end"). */
+type DragZone = {
+  kind: "row" | "end";
+  group: DragGroup;
+  file: TodoFile;
+  item: TodoItem | null;
+  view: View;
+};
+
+type ZoneRect = DragZone & { key: string; x: number; y: number; w: number; h: number };
+
+type ActiveDrag = { key: string; file: TodoFile; item: TodoItem; group: DragGroup };
+
+/** `x`/`y`/`w` locate the indicator line in window coordinates. */
+type ActiveDrop = { file: TodoFile; toIndex: number; x: number; y: number; w: number };
+
+type TodoDragContextValue = {
+  dragging: ActiveDrag | null;
+  register(key: string, get: () => DragZone | null): () => void;
+  beginDrag(key: string, pageX: number, pageY: number): void;
+  moveDrag(pageX: number, pageY: number): void;
+  endDrag(commit: boolean): void;
+};
+
+const TodoDragContext = createContext<TodoDragContextValue | null>(null);
+
+function measureWindow(view: View): Promise<{ x: number; y: number; w: number; h: number } | null> {
+  return new Promise((resolve) => {
+    try {
+      view.measureInWindow((x, y, w, h) => resolve({ x, y, w, h }));
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Drag-and-drop for the todo rows of one surface. Row grips own the responder
+ * (and refuse termination, so the ScrollView cannot steal the gesture); zones
+ * are measured once per drag and re-measured whenever the registry changes
+ * (e.g. a poll landing mid-drag). Drops report a source item plus the
+ * destination file and `toIndex` understood by `todo.move`.
+ */
+function TodoDragProvider({
+  theme,
+  onDrop,
+  children,
+}: {
+  theme: TodoTheme;
+  onDrop: (
+    source: { file: TodoFile; item: TodoItem },
+    target: { file: TodoFile; toIndex: number },
+  ) => void;
+  children: ReactNode;
+}) {
+  const [drag, setDrag] = useState<ActiveDrag | null>(null);
+  const [drop, setDrop] = useState<ActiveDrop | null>(null);
+  const [ghostFrame, setGhostFrame] = useState<{ x: number; w: number } | null>(null);
+  const [containerXY, setContainerXY] = useState({ x: 0, y: 0 });
+  const zones = useRef(new Map<string, () => DragZone | null>());
+  const zonesVersion = useRef(0);
+  const measuredVersion = useRef(-1);
+  const zoneRects = useRef<ZoneRect[]>([]);
+  const containerRef = useRef<View>(null);
+  const containerXYRef = useRef({ x: 0, y: 0 });
+  const pointer = useRef({ x: 0, y: 0 });
+  const pointerY = useRef(new Animated.Value(0)).current;
+  const dragRef = useRef<ActiveDrag | null>(null);
+  const dropRef = useRef<ActiveDrop | null>(null);
+  const onDropRef = useLatest(onDrop);
+
+  const refreshRects = useCallback(async (group: DragGroup) => {
+    const entries: { key: string; zone: DragZone }[] = [];
+    for (const [key, get] of zones.current) {
+      const zone = get();
+      if (zone && zone.group === group) entries.push({ key, zone });
+    }
+    const rects = await Promise.all(
+      entries.map(async ({ key, zone }) => {
+        const rect = await measureWindow(zone.view);
+        return rect ? { key, ...zone, ...rect } : null;
+      }),
+    );
+    zoneRects.current = rects.filter((rect): rect is ZoneRect => rect !== null);
+    measuredVersion.current = zonesVersion.current;
+  }, []);
+
+  const computeDrop = useCallback((pageY: number): ActiveDrop | null => {
+    for (const rect of zoneRects.current) {
+      if (rect.kind !== "row" || !rect.item) continue;
+      if (pageY >= rect.y && pageY <= rect.y + rect.h) {
+        const after = pageY > rect.y + rect.h / 2;
+        return {
+          file: rect.file,
+          toIndex: after ? rect.item.index + 1 : rect.item.index,
+          x: rect.x,
+          y: after ? rect.y + rect.h : rect.y,
+          w: rect.w,
+        };
+      }
+    }
+    for (const rect of zoneRects.current) {
+      if (rect.kind !== "end") continue;
+      if (pageY >= rect.y && pageY <= rect.y + rect.h) {
+        return { file: rect.file, toIndex: rect.file.items.length, x: rect.x, y: rect.y + rect.h, w: rect.w };
+      }
+    }
+    return null;
+  }, []);
+
+  const updateFromPointer = useCallback(() => {
+    if (!dragRef.current) return;
+    const { y } = pointer.current;
+    pointerY.setValue(y - containerXYRef.current.y);
+    const apply = () => {
+      const next = computeDrop(y);
+      const prev = dropRef.current;
+      if (next?.file.path !== prev?.file.path || next?.toIndex !== prev?.toIndex || next?.y !== prev?.y) {
+        dropRef.current = next;
+        setDrop(next);
+      }
+    };
+    if (measuredVersion.current !== zonesVersion.current) {
+      void refreshRects(dragRef.current.group).then(apply);
+      return;
+    }
+    apply();
+  }, [computeDrop, pointerY, refreshRects]);
+
+  const beginDrag = useCallback(
+    (key: string, pageX: number, pageY: number) => {
+      if (dragRef.current) return;
+      const zone = zones.current.get(key)?.();
+      if (!zone || zone.kind !== "row" || !zone.item) return;
+      const active: ActiveDrag = { key, file: zone.file, item: zone.item, group: zone.group };
+      dragRef.current = active;
+      pointer.current = { x: pageX, y: pageY };
+      zonesVersion.current += 1;
+      setDrag(active);
+      const container = containerRef.current;
+      if (container) {
+        container.measureInWindow((cx, cy) => {
+          containerXYRef.current = { x: cx, y: cy };
+          setContainerXY({ x: cx, y: cy });
+          pointerY.setValue(pointer.current.y - cy);
+          void measureWindow(zone.view).then((rect) => {
+            if (rect && dragRef.current?.key === key) {
+              setGhostFrame({ x: rect.x - cx, w: rect.w });
+            }
+          });
+        });
+      }
+      // Compute the drop once the fresh rects land so a quick drag still lands.
+      void refreshRects(zone.group).then(updateFromPointer);
+    },
+    [pointerY, refreshRects, updateFromPointer],
+  );
+
+  const moveDrag = useCallback(
+    (pageX: number, pageY: number) => {
+      if (!dragRef.current) return;
+      pointer.current = { x: pageX, y: pageY };
+      updateFromPointer();
+    },
+    [updateFromPointer],
+  );
+
+  const endDrag = useCallback((commit: boolean) => {
+    const active = dragRef.current;
+    const target = dropRef.current;
+    dragRef.current = null;
+    dropRef.current = null;
+    zoneRects.current = [];
+    measuredVersion.current = -1;
+    setDrag(null);
+    setDrop(null);
+    setGhostFrame(null);
+    if (!commit || !active || !target) return;
+    if (target.file.path === active.file.path) {
+      const landing = target.toIndex > active.item.index ? target.toIndex - 1 : target.toIndex;
+      if (landing === active.item.index) return; // Dropped where it already sits.
+    }
+    onDropRef.current(
+      { file: active.file, item: active.item },
+      { file: target.file, toIndex: target.toIndex },
+    );
+  }, []);
+
+  const value = useMemo<TodoDragContextValue>(
+    () => ({
+      dragging: drag,
+      register: (key, get) => {
+        zones.current.set(key, get);
+        zonesVersion.current += 1;
+        return () => {
+          zones.current.delete(key);
+          zonesVersion.current += 1;
+        };
+      },
+      beginDrag,
+      moveDrag,
+      endDrag,
+    }),
+    [drag, beginDrag, moveDrag, endDrag],
+  );
+
+  return (
+    <TodoDragContext.Provider value={value}>
+      <View ref={containerRef} collapsable={false} style={styles.fill}>
+        {children}
+        {drag ? (
+          <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+            {drop ? (
+              <View
+                style={[
+                  styles.dropLine,
+                  {
+                    backgroundColor: theme.colors.accent,
+                    left: drop.x - containerXY.x,
+                    top: drop.y - containerXY.y - 1,
+                    width: drop.w,
+                  },
+                ]}
+              />
+            ) : null}
+            {ghostFrame ? (
+              <Animated.View
+                style={[
+                  styles.dragGhost,
+                  {
+                    left: ghostFrame.x,
+                    width: ghostFrame.w,
+                    backgroundColor: theme.colors.surface1,
+                    borderColor: theme.colors.accent,
+                    transform: [{ translateY: Animated.subtract(pointerY, 18) }],
+                  },
+                ]}
+              >
+                <Icon name="GripVertical" size={13} color={theme.colors.foregroundMuted} />
+                <Text
+                  numberOfLines={1}
+                  style={[
+                    styles.dragGhostText,
+                    {
+                      color: drag.item.done ? theme.colors.foregroundMuted : theme.colors.foreground,
+                      textDecorationLine: drag.item.done ? "line-through" : "none",
+                    },
+                  ]}
+                >
+                  {drag.item.text}
+                </Text>
+              </Animated.View>
+            ) : null}
+          </View>
+        ) : null}
+      </View>
+    </TodoDragContext.Provider>
+  );
+}
 
 export function TodoSidebarItem({ theme, currentScreen, openScreen }: PluginSidebarItemProps) {
   const { data } = useTodoList();
@@ -273,6 +649,8 @@ function TodoRow({
   item,
   last,
   theme,
+  file,
+  group,
   onToggle,
   onEdit,
   onSetNote,
@@ -281,6 +659,8 @@ function TodoRow({
   item: TodoItem;
   last: boolean;
   theme: TodoTheme;
+  file: TodoFile;
+  group: DragGroup;
   onToggle: (text: string) => void;
   onEdit: (text: string, newText: string) => void;
   onSetNote: (text: string, note: string) => void;
@@ -306,6 +686,22 @@ function TodoRow({
   const titleInputRef = useRef<NativeTextInput>(null);
   const noteInputRef = useRef<NativeTextInput>(null);
   const expandAnim = useRef(new Animated.Value(0)).current;
+  const drag = useContext(TodoDragContext);
+  const rowRef = useRef<View>(null);
+  const zoneKey = `${file.projectId ?? "global"}|${group}|${item.index}`;
+  const zoneData = useLatest({ file, group, item });
+  const lifted = drag?.dragging?.key === zoneKey;
+
+  useLayoutEffect(() => {
+    if (!drag) return;
+    return drag.register(zoneKey, () => {
+      const view = rowRef.current;
+      const { file: zoneFile, group: zoneGroup, item: zoneItem } = zoneData.current;
+      return view
+        ? { kind: "row", group: zoneGroup, file: zoneFile, item: zoneItem, view }
+        : null;
+    });
+  }, [drag, zoneKey]);
 
   // Props that differ from what this row last saw come from a poll, or from
   // this row's own optimistic commit echoing back. While a draft is dirty we
@@ -389,7 +785,15 @@ function TodoRow({
   };
 
   return (
-    <View style={[!last && styles.divider, { borderBottomColor: theme.colors.border }]}>
+    <View
+      ref={rowRef}
+      collapsable={false}
+      style={[
+        !last && styles.divider,
+        { borderBottomColor: theme.colors.border },
+        lifted && styles.dragLifted,
+      ]}
+    >
       <View style={styles.row}>
         <Pressable
           accessibilityRole="checkbox"
@@ -484,6 +888,27 @@ function TodoRow({
             />
           </Pressable>
         </View>
+        {drag ? (
+          <View
+            accessibilityRole="button"
+            accessibilityLabel={`Drag to reorder ${item.text}`}
+            hitSlop={6}
+            onStartShouldSetResponder={() => true}
+            onMoveShouldSetResponder={() => true}
+            onResponderGrant={(event) =>
+              drag.beginDrag(zoneKey, event.nativeEvent.pageX, event.nativeEvent.pageY)
+            }
+            onResponderMove={(event) =>
+              drag.moveDrag(event.nativeEvent.pageX, event.nativeEvent.pageY)
+            }
+            onResponderRelease={() => drag.endDrag(true)}
+            onResponderTerminate={() => drag.endDrag(false)}
+            onResponderTerminationRequest={() => false}
+            style={styles.dragHandle}
+          >
+            <Icon name="GripVertical" size={13} color={theme.colors.foregroundMuted} />
+          </View>
+        ) : null}
       </View>
       <Animated.View
         style={[
@@ -566,12 +991,14 @@ function TodoRow({
 function TodoRows({
   items,
   file,
+  group,
   theme,
   todos,
   last,
 }: {
   items: TodoItem[];
   file: TodoFile;
+  group: DragGroup;
   theme: TodoTheme;
   todos: TodoActions;
   last: boolean;
@@ -582,6 +1009,8 @@ function TodoRows({
       item={item}
       last={last && idx === items.length - 1}
       theme={theme}
+      file={file}
+      group={group}
       onToggle={(text) => todos.toggle(file, item.index, text)}
       onEdit={(text, newText) => todos.edit(file, item.index, text, newText)}
       onSetNote={(text, note) => todos.setNote(file, item.index, text, note)}
@@ -608,9 +1037,30 @@ function TodoSection({
   const doneItems = file.items.filter((item) => item.done);
   const total = file.items.length;
   const isGlobal = file.projectId === null;
+  const drag = useContext(TodoDragContext);
+  // The whole section (header + card) is the "append at end" zone for both
+  // groups; row zones take priority for precise positions. This also lets a
+  // done item drop into a file that has no completed items yet.
+  const sectionRef = useRef<View>(null);
+  const zoneFile = useLatest(file);
+  const baseKey = `${file.projectId ?? "global"}|${file.path}`;
+
+  useLayoutEffect(() => {
+    if (!drag) return;
+    const endZone = (group: DragGroup) => () =>
+      sectionRef.current
+        ? { kind: "end" as const, group, file: zoneFile.current, item: null, view: sectionRef.current }
+        : null;
+    const offOpen = drag.register(`${baseKey}|end|open`, endZone("open"));
+    const offDone = drag.register(`${baseKey}|end|done`, endZone("done"));
+    return () => {
+      offOpen();
+      offDone();
+    };
+  }, [drag, baseKey]);
 
   return (
-    <View style={styles.section}>
+    <View ref={sectionRef} collapsable={false} style={styles.section}>
       {compactHeader ? (
         <View style={styles.compactHeader}>
           <View style={styles.spacedRow}>
@@ -688,12 +1138,13 @@ function TodoSection({
           <TodoRows
             items={openItems}
             file={file}
+            group="open"
             theme={theme}
             todos={todos}
             last={doneItems.length === 0}
           />
           {doneItems.length > 0 ? (
-            <>
+            <View>
               <View
                 style={[
                   styles.spacedRow,
@@ -722,9 +1173,16 @@ function TodoSection({
                 </Pressable>
               </View>
               {showDone ? (
-                <TodoRows items={doneItems} file={file} theme={theme} todos={todos} last />
+                <TodoRows
+                  items={doneItems}
+                  file={file}
+                  group="done"
+                  theme={theme}
+                  todos={todos}
+                  last
+                />
               ) : null}
-            </>
+            </View>
           ) : null}
         </View>
       )}
@@ -934,6 +1392,30 @@ function KeyboardAvoidingSurface({
   );
 }
 
+/** Provider + keyboard-avoiding shell shared by the screen and the panel. */
+function TodoDragSurface({
+  theme,
+  todos,
+  children,
+}: {
+  theme: TodoTheme;
+  todos: TodoActions;
+  children: ReactNode;
+}) {
+  return (
+    <TodoDragProvider
+      theme={theme}
+      onDrop={(source, to) =>
+        todos.move(source.file, source.item.index, source.item.text, to.file, to.toIndex)
+      }
+    >
+      <KeyboardAvoidingSurface style={[styles.fill, { backgroundColor: theme.colors.surface0 }]}>
+        {children}
+      </KeyboardAvoidingSurface>
+    </TodoDragProvider>
+  );
+}
+
 export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
   const todos = useTodos();
   const [filter, setFilter] = useState<FilterMode>("all");
@@ -957,7 +1439,7 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
   const target = files.find((file) => file.projectId === targetProjectId) ?? GLOBAL_TARGET;
 
   return (
-    <KeyboardAvoidingSurface style={[styles.fill, { backgroundColor: theme.colors.surface0 }]}>
+    <TodoDragSurface theme={theme} todos={todos}>
       <ScrollView
         style={styles.fill}
         contentContainerStyle={[styles.screenContent, { padding: layout.compact ? 16 : 28 }]}
@@ -1052,7 +1534,7 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
         onAdd={todos.add}
         error={todos.error}
       />
-    </KeyboardAvoidingSurface>
+    </TodoDragSurface>
   );
 }
 
@@ -1104,7 +1586,7 @@ function WorkspaceTodoPillPopover({
             { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
           ]}
         >
-          <TodoRows items={openItems} file={file} theme={theme} todos={todos} last />
+          <TodoRows items={openItems} file={file} group="open" theme={theme} todos={todos} last />
         </View>
       ) : null}
 
@@ -1239,7 +1721,12 @@ export function contributeComposerPills(client: PluginClientContext) {
     const epoch = mutationEpoch;
     try {
       const data = await client.rpc(listTodos, {});
-      if (!stopped && activeMutations === 0 && epoch === mutationEpoch) publishTodoData(data);
+      if (!stopped && activeMutations === 0 && epoch === mutationEpoch) {
+        publishTodoData(data);
+        // Keep any mounted surface's cache in sync too; publishTodoData only
+        // reaches the non-query listeners (the pills).
+        todoQueryClient?.setQueryData(LIST_KEY, data);
+      }
     } catch {
       // Transient RPC or reconnect errors recover on the next poll.
     } finally {
@@ -1369,7 +1856,7 @@ export function WorkspaceTodosPanel({ theme, workspaceId }: PluginWorkspacePanel
   }
 
   return (
-    <KeyboardAvoidingSurface style={[styles.fill, { backgroundColor: theme.colors.surface0 }]}>
+    <TodoDragSurface theme={theme} todos={todos}>
       <ScrollView
         style={styles.fill}
         contentContainerStyle={styles.panelContent}
@@ -1384,7 +1871,7 @@ export function WorkspaceTodosPanel({ theme, workspaceId }: PluginWorkspacePanel
         onAdd={todos.add}
         error={todos.error}
       />
-    </KeyboardAvoidingSurface>
+    </TodoDragSurface>
   );
 }
 
@@ -1604,9 +2091,38 @@ const styles = StyleSheet.create({
     fontSize: 13.5,
     lineHeight: 19,
   },
+  dragHandle: {
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: -4,
+    paddingLeft: 4,
+  },
+  dragLifted: {
+    opacity: 0.3,
+  },
+  dropLine: {
+    position: "absolute",
+    height: 2,
+    borderRadius: 1,
+  },
+  dragGhost: {
+    position: "absolute",
+    top: 0,
+    height: 36,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+  },
+  dragGhostText: {
+    flex: 1,
+    fontSize: 13.5,
+    lineHeight: 19,
+  },
   editInput: {
     padding: 0,
-    paddingVertical: 0,
     margin: 0,
   },
   completedBar: {
