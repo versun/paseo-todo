@@ -8,7 +8,10 @@ import {
   addTodo,
   editTodo,
   listTodos,
+  messageOf,
+  normalizeNoteText,
   normalizeTaskText,
+  noteTodo,
   removeTodo,
   toggleTodo,
   type TodoItem,
@@ -29,6 +32,31 @@ type Line = { text: string; eol: string };
 
 function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Canonicalize a path for comparison (symlinks resolved). Missing paths fall
+ * back to plain normalization so they can still be classified.
+ */
+function canonicalDir(path: string): Promise<string> {
+  return realpath(path).catch(() => resolve(path));
+}
+
+let homeDirs: Promise<{ home: string; paseo: string }> | undefined;
+
+function canonicalHomeDirs() {
+  homeDirs ??= Promise.all([canonicalDir(HOME_DIR), canonicalDir(PASEO_HOME)]).then(
+    ([home, paseo]) => ({ home, paseo }),
+  );
+  return homeDirs;
 }
 
 async function readText(path: string): Promise<string> {
@@ -100,13 +128,45 @@ function joinLines(lines: Line[]): string {
   return lines.map((line) => line.text + line.eol).join("");
 }
 
+/**
+ * Indented lines under a task are its note block. Whitespace-only lines are
+ * absorbed (they contribute no text but are rewritten with the block); without
+ * that they'd strand the indented lines below them as invisible leftovers.
+ * Indented checkboxes stay separate items, as before.
+ */
+function isNoteLine(text: string): boolean {
+  return /^\s/.test(text) && !CHECKBOX.test(text);
+}
+
+/**
+ * The note text of an indented line. Checkbox-shaped notes are written with a
+ * zero-width space after the indent (see noteTodoHandler); it is not
+ * whitespace, so trim() keeps it and it is dropped here to round-trip.
+ */
+function noteText(text: string): string {
+  const trimmed = text.trim();
+  return trimmed.startsWith("\u200B") ? trimmed.slice(1) : trimmed;
+}
+
 function parseItems(source: string): TodoItem[] {
-  let index = 0;
-  return splitLines(source).flatMap((line) => {
-    const match = CHECKBOX.exec(line.text);
-    if (!match) return [];
-    return [{ index: index++, text: match[4].trim(), done: match[2] !== " " }];
-  });
+  const items: TodoItem[] = [];
+  const lines = splitLines(source);
+  for (let i = 0; i < lines.length; i++) {
+    const match = CHECKBOX.exec(lines[i].text);
+    if (!match) continue;
+    const note: string[] = [];
+    while (i + 1 < lines.length && isNoteLine(lines[i + 1].text)) {
+      const text = noteText(lines[++i].text);
+      if (text) note.push(text);
+    }
+    items.push({
+      index: items.length,
+      text: match[4].trim(),
+      done: match[2] !== " ",
+      note: note.join("\n"),
+    });
+  }
+  return items;
 }
 
 /**
@@ -124,11 +184,21 @@ function locateLine(lines: Line[], index: number, text: string) {
   throw new Error(STALE_TASK);
 }
 
-/** `~` is the global file and `~/.paseo` is Paseo's own home; neither is a project. */
-function isProjectRoot(root: string): boolean {
-  if (!root) return false;
-  const normalized = resolve(root);
-  return normalized !== HOME_DIR && normalized !== PASEO_HOME;
+/** The file's most common line ending; `\n` when there are none yet. */
+function dominantEol(lines: Line[]): string {
+  const counts = new Map<string, number>();
+  for (const { eol } of lines) {
+    if (eol) counts.set(eol, (counts.get(eol) ?? 0) + 1);
+  }
+  let best = "\n";
+  let bestCount = 0;
+  for (const [eol, count] of counts) {
+    if (count > bestCount) {
+      best = eol;
+      bestCount = count;
+    }
+  }
+  return best;
 }
 
 function projectLabel(project: Project): string {
@@ -138,22 +208,20 @@ function projectLabel(project: Project): string {
 async function resolvePath(paseo: PaseoApi, projectId: string | null): Promise<string> {
   if (!projectId) return GLOBAL_FILE;
   // Bounded so a hung daemon call cannot stall the mutation queue forever.
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error("Timed out looking up the project")),
-      PROJECTS_TIMEOUT_MS,
-    );
-  });
-  const { projects } = await Promise.race([paseo.projects.list(), timeout]).finally(() =>
-    clearTimeout(timer),
+  const { projects } = await withTimeout(
+    paseo.projects.list(),
+    PROJECTS_TIMEOUT_MS,
+    "Timed out looking up the project",
   );
   const project = projects.find((item) => item.projectId === projectId);
-  // A workspace rooted at `~` uses the global list, as in the Explorer panel.
-  if (project?.projectRootPath && resolve(project.projectRootPath) === HOME_DIR) {
-    return GLOBAL_FILE;
-  }
-  if (!project || !isProjectRoot(project.projectRootPath)) {
+  const canonical = project?.projectRootPath
+    ? await canonicalDir(project.projectRootPath)
+    : "";
+  const { home, paseo: paseoHome } = await canonicalHomeDirs();
+  // A workspace rooted at `~` (or a symlink to it) uses the global list.
+  if (canonical === home) return GLOBAL_FILE;
+  // `~/.paseo` is Paseo's own home; neither it nor an unknown root is a project.
+  if (!project || canonical === "" || canonical === paseoHome) {
     throw new Error("Project not found");
   }
   return join(project.projectRootPath, "TODO.md");
@@ -187,8 +255,8 @@ export async function listTodosHandler(
   { paseo }: PluginHandlerContext,
 ) {
   const [{ projects }, { entries }] = await Promise.all([
-    paseo.projects.list(),
-    paseo.workspaces.list(),
+    withTimeout(paseo.projects.list(), PROJECTS_TIMEOUT_MS, "Timed out listing projects"),
+    withTimeout(paseo.workspaces.list(), PROJECTS_TIMEOUT_MS, "Timed out listing workspaces"),
   ]);
 
   const activeWorkspaceByProject = new Map<string, string>();
@@ -199,36 +267,67 @@ export async function listTodosHandler(
     }
   }
 
-  // Projects sharing a root share one read.
-  const reads = new Map<string, Promise<TodoItem[]>>();
-  const loadItems = (path: string) => {
-    let pending = reads.get(path);
-    if (!pending) {
-      pending = readText(path).then(parseItems);
-      reads.set(path, pending);
-    }
+  // Files that fail to read degrade to an empty list carrying the error,
+  // so one bad TODO.md cannot take down every other list.
+  type FileItems = { items: TodoItem[]; error?: string };
+  const reads = new Map<string, Promise<FileItems>>();
+  const loadItems = (path: string): Promise<FileItems> => {
+    const cached = reads.get(path);
+    if (cached) return cached;
+    const pending = (async () => {
+      // Paths aliasing one file (e.g. a symlinked project root) share the read.
+      const key = await realpath(path).catch(() => path);
+      if (key !== path) {
+        const shared = reads.get(key);
+        if (shared) return shared;
+      }
+      const result = readText(path)
+        .then((source): FileItems => ({ items: parseItems(source) }))
+        .catch((error: unknown): FileItems => ({ items: [], error: messageOf(error) }));
+      if (key !== path) reads.set(key, result);
+      return result;
+    })();
+    reads.set(path, pending);
     return pending;
   };
 
-  const validProjects = projects
-    .filter((project) => isProjectRoot(project.projectRootPath))
+  const { home, paseo: paseoHome } = await canonicalHomeDirs();
+  const classified = await Promise.all(
+    projects.map(async (project) => {
+      const canonical = project.projectRootPath
+        ? await canonicalDir(project.projectRootPath)
+        : "";
+      return { project, canonical };
+    }),
+  );
+  const valid = classified.filter(
+    ({ canonical }) => canonical !== "" && canonical !== home && canonical !== paseoHome,
+  );
+  const homeProjectIds = classified
+    .filter(({ canonical }) => canonical === home)
+    .map(({ project }) => project.projectId);
+
+  const validProjects = valid
+    .map(({ project }) => project)
     .sort((a, b) => {
       const aActive = activeWorkspaceByProject.has(a.projectId) ? 0 : 1;
       const bActive = activeWorkspaceByProject.has(b.projectId) ? 0 : 1;
       return aActive - bActive || projectLabel(a).localeCompare(projectLabel(b));
     });
 
-  const [globalItems, projectFiles] = await Promise.all([
+  const [globalLoad, projectFiles] = await Promise.all([
     loadItems(GLOBAL_FILE),
     Promise.all(
       validProjects.map(async (project) => {
         const path = join(project.projectRootPath, "TODO.md");
+        const loaded = await loadItems(path);
         return {
           projectId: project.projectId,
           workspaceId: activeWorkspaceByProject.get(project.projectId) ?? null,
           label: projectLabel(project),
           path,
-          items: await loadItems(path),
+          items: loaded.items,
+          error: loaded.error,
         };
       }),
     ),
@@ -240,9 +339,11 @@ export async function listTodosHandler(
       workspaceId: null,
       label: "Global",
       path: GLOBAL_FILE,
-      items: globalItems,
+      items: globalLoad.items,
+      error: globalLoad.error,
     },
     projects: projectFiles,
+    homeProjectIds,
   };
 }
 
@@ -257,8 +358,8 @@ export async function addTodoHandler(
   return mutateTodoFile(paseo, projectId, (existing) => {
     const lines = splitLines(existing);
     const last = lines[lines.length - 1];
-    // Reuse the file's own line ending; default to `\n` for an empty file.
-    const eol = last?.eol || /\r\n|\n|\r/.exec(existing)?.[0] || "\n";
+    // Reuse the last line's ending, else the file's dominant one (`\n` if empty).
+    const eol = last?.eol || dominantEol(lines);
     const separator = last && !last.eol ? eol : "";
     return `${existing}${separator}- [ ] ${task}${eol}`;
   });
@@ -291,6 +392,47 @@ export async function editTodoHandler(
   });
 }
 
+export async function noteTodoHandler(
+  { projectId, index, text, note }: RpcInput<typeof noteTodo>,
+  { paseo }: PluginHandlerContext,
+) {
+  const next = normalizeNoteText(note);
+  return mutateTodoFile(paseo, projectId, (existing) => {
+    const lines = splitLines(existing);
+    const { line } = locateLine(lines, index, text);
+    let end = line + 1;
+    while (end < lines.length && isNoteLine(lines[end].text)) end++;
+    const current = lines
+      .slice(line + 1, end)
+      .map((entry) => noteText(entry.text))
+      .filter(Boolean)
+      .join("\n");
+    if (current === next) return null; // No-op leaves the file alone.
+    if (!next) {
+      lines.splice(line + 1, end - line - 1);
+      return joinLines(lines);
+    }
+    // Reuse the task's own indent + line ending; an unterminated task line gets
+    // the file's dominant ending so the note lines can follow it. Indents only
+    // ever inherit plain spaces/tabs, not exotic whitespace.
+    const indent = `${lines[line].text.match(/^[ \t]*/)![0]}  `;
+    const eol = lines[line].eol || dominantEol(lines);
+    if (!lines[line].eol) lines[line].eol = eol;
+    lines.splice(
+      line + 1,
+      end - line - 1,
+      ...next.split("\n").map((noteLine) => {
+        const text = `${indent}${noteLine}`;
+        // A note shaped like a checkbox ("- [ ] …") would re-parse as a real
+        // task. A zero-width space is invisible, is not `\s` (so CHECKBOX
+        // fails), and noteText() drops it again on read.
+        return { text: CHECKBOX.test(text) ? `${indent}\u200B${noteLine}` : text, eol };
+      }),
+    );
+    return joinLines(lines);
+  });
+}
+
 export async function removeTodoHandler(
   { projectId, index, text }: RpcInput<typeof removeTodo>,
   { paseo }: PluginHandlerContext,
@@ -299,11 +441,17 @@ export async function removeTodoHandler(
     const lines = splitLines(existing);
     // Without `index`, clear every completed item; a no-op leaves the file alone.
     const target = index === undefined ? null : locateLine(lines, index, text ?? "").line;
-    const next = lines.filter((line, lineIndex) => {
-      if (target !== null) return lineIndex !== target;
-      const match = CHECKBOX.exec(line.text);
-      return !match || match[2] === " ";
-    });
+    const drop = new Set<number>();
+    for (let i = 0; i < lines.length; i++) {
+      const match = CHECKBOX.exec(lines[i].text);
+      const removing = target !== null ? i === target : match !== null && match[2] !== " ";
+      if (!removing) continue;
+      drop.add(i);
+      // A removed task takes the indented note lines under it along.
+      let j = i + 1;
+      while (j < lines.length && isNoteLine(lines[j].text)) drop.add(j++);
+    }
+    const next = lines.filter((_, lineIndex) => !drop.has(lineIndex));
     return next.length === lines.length ? null : joinLines(next);
   });
 }

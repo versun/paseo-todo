@@ -9,21 +9,27 @@ import type {
 import { useRpc, useWorkspace } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, SidebarRow, TextInput } from "@getpaseo/plugin/client/ui";
 import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import {
+  Animated,
+  Easing,
   KeyboardAvoidingView,
   Pressable,
   StyleSheet,
   Text,
   View,
   type StyleProp,
+  type TextInput as NativeTextInput,
   type ViewStyle,
 } from "react-native";
 import {
   addTodo,
   editTodo,
   listTodos,
+  messageOf,
+  normalizeNoteText,
   normalizeTaskText,
+  noteTodo,
   removeTodo,
   toggleTodo,
   visibleTodoFiles,
@@ -53,15 +59,19 @@ let recheckPills: (() => void) | null = null;
 
 function publishTodoData(data: TodoListData) {
   latestTodoData = data;
-  for (const listener of dataListeners) listener(data);
+  for (const listener of dataListeners) {
+    try {
+      listener(data);
+    } catch (error) {
+      // A failing listener (e.g. pill registration) must not fail the fetch or
+      // starve the listeners after it.
+      console.error("[todo] data listener failed", error);
+    }
+  }
 }
 
 export function refreshTodoPills() {
   recheckPills?.();
-}
-
-function messageOf(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function openCount(files: TodoFile[]) {
@@ -78,13 +88,16 @@ function updateFile(
   const path =
     projectId === null
       ? data.global.path
-      : data.projects.find((file) => file.projectId === projectId)?.path;
+      : (data.projects.find((file) => file.projectId === projectId)?.path ??
+        // Projects rooted at `~` (even via symlink) are not listed; their file
+        // is the global one.
+        (data.homeProjectIds.includes(projectId) ? data.global.path : undefined));
   if (!path) return data;
   const apply = (file: TodoFile): TodoFile =>
     file.path === path
       ? { ...file, items: updater(file.items).map((item, index) => ({ ...item, index })) }
       : file;
-  return { global: apply(data.global), projects: data.projects.map(apply) };
+  return { ...data, global: apply(data.global), projects: data.projects.map(apply) };
 }
 
 /** Polling pauses while a mutation is in flight so a poll cannot revert an optimistic edit. */
@@ -117,13 +130,12 @@ function useTodoMutation<Input extends { projectId: string | null }>(
     onMutate: async (input: Input) => {
       activeMutations += 1;
       mutationEpoch += 1;
-      const cancel = queryClient.cancelQueries({ queryKey: LIST_KEY });
+      await queryClient.cancelQueries({ queryKey: LIST_KEY });
       queryClient.setQueryData<TodoListData>(LIST_KEY, (prev) => {
         const next = updateFile(prev, input.projectId, (items) => optimistic(items, input));
         if (next && next !== prev) publishTodoData(next);
         return next;
       });
-      await cancel;
     },
     onSuccess: () => setError(null),
     onError: (cause) => setError(messageOf(cause)),
@@ -153,13 +165,14 @@ function useTodos() {
   const addRpc = useRpc(addTodo);
   const toggleRpc = useRpc(toggleTodo);
   const editRpc = useRpc(editTodo);
+  const noteRpc = useRpc(noteTodo);
   const removeRpc = useRpc(removeTodo);
 
   const add = useTodoMutation(
     addRpc,
     (items, { text }) => [
       ...items,
-      { index: items.length, text: normalizeTaskText(text), done: false },
+      { index: items.length, text: normalizeTaskText(text), done: false, note: "" },
     ],
     setActionError,
   );
@@ -175,6 +188,12 @@ function useTodos() {
       items.map((item) =>
         item.index === index ? { ...item, text: normalizeTaskText(newText) } : item,
       ),
+    setActionError,
+  );
+  const setNote = useTodoMutation(
+    noteRpc,
+    (items, { index, note }) =>
+      items.map((item) => (item.index === index ? { ...item, note } : item)),
     setActionError,
   );
   const remove = useTodoMutation(
@@ -197,6 +216,13 @@ function useTodos() {
         index,
         text,
         newText: normalizeTaskText(newText),
+      }),
+    setNote: (file: TodoFile, index: number, text: string, note: string) =>
+      setNote.mutate({
+        projectId: file.projectId,
+        index,
+        text,
+        note: normalizeNoteText(note),
       }),
     remove: (file: TodoFile, index: number, text: string) =>
       remove.mutate({ projectId: file.projectId, index, text }),
@@ -250,6 +276,7 @@ function TodoRow({
   theme,
   onToggle,
   onEdit,
+  onSetNote,
   onRemove,
 }: {
   item: TodoItem;
@@ -257,43 +284,73 @@ function TodoRow({
   theme: TodoTheme;
   onToggle: (text: string) => void;
   onEdit: (text: string, newText: string) => void;
+  onSetNote: (text: string, note: string) => void;
   onRemove: (text: string) => void;
 }) {
-  const [editing, setEditing] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const [draft, setDraft] = useState(item.text);
-  // Tracks the authoritative text for this row, including an optimistic edit
-  // committed earlier in the same gesture before React has re-rendered.
+  const [draftNote, setDraftNote] = useState(item.note);
+  const [noteFocused, setNoteFocused] = useState(false);
+  const [panelHeight, setPanelHeight] = useState(0);
+  // Tracks the authoritative text/note for this row, including an optimistic
+  // edit committed earlier in the same gesture before React has re-rendered.
   const currentText = useRef(item.text);
+  const currentNote = useRef(item.note);
   const prevPropText = useRef(item.text);
-  const prevPropDone = useRef(item.done);
-  // onSubmitEditing, onBlur, and row actions can overlap; commit at most once.
+  const prevPropNote = useRef(item.note);
+  // The unmount cleanup sets this so an unmount blur (e.g. a removed row or
+  // filter switch) can never fire a stale edit. Escape sets it too, so the
+  // blur it triggers cancels the draft instead of committing it; focusing the
+  // input again clears it.
   const committed = useRef(false);
+  const noteCommitted = useRef(false);
+  const titleInputRef = useRef<NativeTextInput>(null);
+  const noteInputRef = useRef<NativeTextInput>(null);
+  const expandAnim = useRef(new Animated.Value(0)).current;
 
-  if (item.text !== prevPropText.current || item.done !== prevPropDone.current) {
-    const externalChange =
-      item.text !== currentText.current || item.done !== prevPropDone.current;
+  // A text prop that differs from our own optimistic commit came from
+  // elsewhere (a poll), so it replaces the draft; an echo of the commit leaves
+  // an in-progress draft alone.
+  if (item.text !== prevPropText.current) {
+    const externalChange = item.text !== currentText.current;
     prevPropText.current = item.text;
-    prevPropDone.current = item.done;
     currentText.current = item.text;
-    if (editing && externalChange) {
-      committed.current = true;
-      setEditing(false);
-      setDraft(item.text);
-    }
+    if (externalChange) setDraft(item.text);
+  }
+  // Same guard for the note: a clobbered draft is only safe when the user has
+  // no unsaved note edits, so a poll never wipes out an in-progress note.
+  if (item.note !== prevPropNote.current) {
+    const externalChange = item.note !== currentNote.current;
+    const draftClean = normalizeNoteText(draftNote) === currentNote.current;
+    prevPropNote.current = item.note;
+    currentNote.current = item.note;
+    if (externalChange && draftClean) setDraftNote(item.note);
   }
 
   // Never let an unmount blur (e.g. a removed row or filter switch) fire a stale edit.
   useLayoutEffect(
     () => () => {
       committed.current = true;
+      noteCommitted.current = true;
     },
     [],
   );
 
+  useEffect(() => {
+    const animation = Animated.timing(expandAnim, {
+      toValue: expanded ? panelHeight : 0,
+      duration: 180,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: false,
+    });
+    animation.start();
+    return () => animation.stop();
+  }, [expanded, panelHeight, expandAnim]);
+
+  // Idempotent: onSubmitEditing, onBlur, and collapsing can all call it, and
+  // only the first call that sees a real change fires onEdit.
   const commit = (): string => {
     if (committed.current) return currentText.current;
-    committed.current = true;
-    setEditing(false);
     const next = normalizeTaskText(draft);
     const prev = currentText.current;
     if (next && next !== prev) {
@@ -301,97 +358,207 @@ function TodoRow({
       onEdit(prev, next);
       return next;
     }
+    if (draft !== prev) setDraft(prev);
     return prev;
   };
 
+  const commitNote = () => {
+    if (noteCommitted.current) return;
+    noteCommitted.current = true;
+    const next = normalizeNoteText(draftNote);
+    if (next !== currentNote.current) {
+      currentNote.current = next;
+      onSetNote(currentText.current, next);
+    }
+  };
+
+  const toggleExpanded = () => {
+    if (expanded) {
+      commit();
+      commitNote();
+      // Keep the keyboard from staying up on the collapsed (height-0) inputs;
+      // the blurs' commit no-ops since the drafts were just settled above.
+      titleInputRef.current?.blur();
+      noteInputRef.current?.blur();
+      setExpanded(false);
+    } else {
+      noteCommitted.current = false;
+      setDraft(currentText.current);
+      setDraftNote(currentNote.current);
+      setExpanded(true);
+    }
+  };
+
   return (
-    <View style={[styles.row, !last && styles.divider, { borderBottomColor: theme.colors.border }]}>
-      <Pressable
-        accessibilityRole="checkbox"
-        accessibilityState={{ checked: item.done }}
-        accessibilityLabel={`${item.done ? "Uncheck" : "Check off"} ${item.text}`}
-        hitSlop={8}
-        onPress={() => {
-          const text = editing ? commit() : currentText.current;
-          onToggle(text);
-        }}
-        style={styles.checkboxHit}
-      >
-        <View
-          style={[
-            styles.checkbox,
-            {
-              borderColor: item.done ? theme.colors.accent : theme.colors.border,
-              backgroundColor: item.done ? theme.colors.accent : theme.colors.surface0,
-            },
-          ]}
-        >
-          {item.done ? (
-            <Icon name="Check" size={11} color={theme.colors.accentForeground} />
-          ) : null}
-        </View>
-      </Pressable>
-      {editing ? (
-        <TextInput
-          value={draft}
-          onChangeText={setDraft}
-          autoFocus
-          onSubmitEditing={() => {
-            commit();
-          }}
-          onBlur={() => {
-            commit();
-          }}
-          onKeyPress={({ nativeEvent }) => {
-            if (nativeEvent.key === "Escape") {
-              committed.current = true;
-              setDraft(currentText.current);
-              setEditing(false);
-            }
-          }}
-          returnKeyType="done"
-          accessibilityLabel={`Edit ${item.text}`}
-          style={[styles.itemText, styles.editInput, { color: theme.colors.foreground }]}
-        />
-      ) : (
+    <View style={[!last && styles.divider, { borderBottomColor: theme.colors.border }]}>
+      <View style={styles.row}>
         <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={`Edit ${item.text}`}
+          accessibilityRole="checkbox"
+          accessibilityState={{ checked: item.done }}
+          accessibilityLabel={`${item.done ? "Uncheck" : "Check off"} ${item.text}`}
+          hitSlop={8}
           onPress={() => {
-            committed.current = false;
-            setDraft(currentText.current);
-            setEditing(true);
+            const text = expanded ? commit() : currentText.current;
+            if (expanded) commitNote();
+            onToggle(text);
           }}
-          style={styles.rowMain}
+          style={styles.checkboxHit}
         >
-          <Text
+          <View
             style={[
-              styles.itemText,
+              styles.checkbox,
               {
-                color: item.done ? theme.colors.foregroundMuted : theme.colors.foreground,
-                textDecorationLine: item.done ? "line-through" : "none",
+                borderColor: item.done ? theme.colors.accent : theme.colors.border,
+                backgroundColor: item.done ? theme.colors.accent : theme.colors.surface0,
               },
             ]}
           >
-            {item.text}
-          </Text>
+            {item.done ? (
+              <Icon name="Check" size={11} color={theme.colors.accentForeground} />
+            ) : null}
+          </View>
         </Pressable>
-      )}
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={`Delete ${item.text}`}
-        hitSlop={8}
-        onPress={() => {
-          if (editing) {
-            committed.current = true;
-            setEditing(false);
-          }
-          onRemove(currentText.current);
-        }}
-        style={styles.deleteButton}
+        <View style={styles.rowMain}>
+          {expanded ? (
+            <TextInput
+              ref={titleInputRef}
+              value={draft}
+              onChangeText={setDraft}
+              autoFocus
+              multiline
+              submitBehavior="blurAndSubmit"
+              onFocus={() => {
+                committed.current = false;
+              }}
+              onSubmitEditing={commit}
+              onBlur={commit}
+              onKeyPress={({ nativeEvent }) => {
+                if (nativeEvent.key === "Escape") {
+                  // Cancel: the blur must not commit the dirty draft.
+                  committed.current = true;
+                  setDraft(currentText.current);
+                  titleInputRef.current?.blur();
+                }
+              }}
+              returnKeyType="done"
+              accessibilityLabel={`Edit ${item.text}`}
+              style={[styles.itemText, styles.editInput, { color: theme.colors.foreground }]}
+            />
+          ) : (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityState={{ expanded }}
+              accessibilityLabel={`Show details of ${item.text}`}
+              onPress={toggleExpanded}
+              style={styles.rowTitle}
+            >
+              <Text
+                style={[
+                  styles.itemText,
+                  {
+                    color: item.done ? theme.colors.foregroundMuted : theme.colors.foreground,
+                    textDecorationLine: item.done ? "line-through" : "none",
+                  },
+                ]}
+              >
+                {item.text}
+              </Text>
+              {item.note ? (
+                <Text style={[styles.itemNote, { color: theme.colors.foregroundMuted }]}>
+                  {item.note}
+                </Text>
+              ) : null}
+            </Pressable>
+          )}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ expanded }}
+            accessibilityLabel={`${expanded ? "Hide" : "Show"} details of ${item.text}`}
+            hitSlop={8}
+            onPress={toggleExpanded}
+            style={styles.chevronButton}
+          >
+            <Icon
+              name={expanded ? "ChevronUp" : "ChevronDown"}
+              size={13}
+              color={theme.colors.foregroundMuted}
+            />
+          </Pressable>
+        </View>
+      </View>
+      <Animated.View
+        style={[
+          styles.rowExpand,
+          {
+            height: expandAnim,
+            opacity: expandAnim.interpolate({
+              inputRange: [0, Math.max(panelHeight, 1)],
+              outputRange: [0, 1],
+              extrapolate: "clamp",
+            }),
+          },
+        ]}
       >
-        <Icon name="X" size={13} color={theme.colors.foregroundMuted} />
-      </Pressable>
+        <View
+          style={styles.rowPanel}
+          onLayout={(event) => {
+            const height = event.nativeEvent.layout.height;
+            if (height !== panelHeight) setPanelHeight(height);
+          }}
+        >
+          <TextInput
+            ref={noteInputRef}
+            value={draftNote}
+            onChangeText={setDraftNote}
+            multiline
+            onFocus={() => {
+              noteCommitted.current = false;
+              setNoteFocused(true);
+            }}
+            onBlur={() => {
+              setNoteFocused(false);
+              commitNote();
+            }}
+            onKeyPress={({ nativeEvent }) => {
+              if (nativeEvent.key === "Escape") {
+                noteCommitted.current = true;
+                setDraftNote(currentNote.current);
+                noteInputRef.current?.blur();
+              }
+            }}
+            placeholder="Add a note…"
+            placeholderTextColor={theme.colors.foregroundMuted}
+            accessibilityLabel={`Note for ${item.text}`}
+            style={[
+              styles.noteInput,
+              {
+                color: theme.colors.foreground,
+                backgroundColor: theme.colors.surface0,
+                borderColor: noteFocused ? theme.colors.accent : theme.colors.border,
+              },
+            ]}
+          />
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Delete ${item.text}`}
+            hitSlop={4}
+            onPress={() => {
+              committed.current = true;
+              noteCommitted.current = true;
+              onRemove(currentText.current);
+            }}
+            style={({ pressed }) => [
+              styles.noteDelete,
+              pressed && { backgroundColor: theme.colors.surface2 },
+            ]}
+          >
+            <Icon name="Trash2" size={12} color={theme.colors.statusDanger} />
+            <Text style={[styles.rowActionText, { color: theme.colors.statusDanger }]}>
+              Delete
+            </Text>
+          </Pressable>
+        </View>
+      </Animated.View>
     </View>
   );
 }
@@ -423,6 +590,7 @@ function TodoSection({
       theme={theme}
       onToggle={(text) => todos.toggle(file, item.index, text)}
       onEdit={(text, newText) => todos.edit(file, item.index, text, newText)}
+      onSetNote={(text, note) => todos.setNote(file, item.index, text, note)}
       onRemove={(text) => todos.remove(file, item.index, text)}
     />
   );
@@ -492,7 +660,9 @@ function TodoSection({
         </View>
       )}
 
-      {total === 0 ? (
+      {file.error ? (
+        <EmptyCard theme={theme} text={file.error} danger />
+      ) : total === 0 ? (
         <EmptyCard theme={theme} text="No tasks yet — add one below." />
       ) : (
         <View
@@ -544,7 +714,15 @@ function TodoSection({
   );
 }
 
-function EmptyCard({ theme, text }: { theme: TodoTheme; text: string }) {
+function EmptyCard({
+  theme,
+  text,
+  danger = false,
+}: {
+  theme: TodoTheme;
+  text: string;
+  danger?: boolean;
+}) {
   return (
     <View
       style={[
@@ -552,7 +730,14 @@ function EmptyCard({ theme, text }: { theme: TodoTheme; text: string }) {
         { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
       ]}
     >
-      <Text style={[styles.emptyText, { color: theme.colors.foregroundMuted }]}>{text}</Text>
+      <Text
+        style={[
+          styles.emptyText,
+          { color: danger ? theme.colors.statusDanger : theme.colors.foregroundMuted },
+        ]}
+      >
+        {text}
+      </Text>
     </View>
   );
 }
@@ -857,6 +1042,9 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
 function workspaceFile(data: TodoListData, projectId: string, rootPath: string): TodoFile | null {
   const project = data.projects.find((file) => file.projectId === projectId);
   if (project) return project;
+  // The server tags projects whose root resolves to `~`, symlinks included.
+  if (data.homeProjectIds.includes(projectId)) return data.global;
+  // Fallback for a project the daemon no longer lists at all.
   const homeDir = data.global.path.replace(/[\\/]TODO\.md$/, "");
   return rootPath.replace(/[\\/]+$/, "") === homeDir ? data.global : null;
 }
@@ -906,6 +1094,7 @@ function WorkspaceTodoPillPopover({
               theme={theme}
               onToggle={(text) => todos.toggle(file, item.index, text)}
               onEdit={(text, newText) => todos.edit(file, item.index, text, newText)}
+              onSetNote={(text, note) => todos.setNote(file, item.index, text, note)}
               onRemove={(text) => todos.remove(file, item.index, text)}
             />
           ))}
@@ -1167,10 +1356,7 @@ export function WorkspaceTodosPanel({ theme, workspaceId }: PluginWorkspacePanel
     projectId: snapshot.projectId,
     projectRootPath: snapshot.projectRootPath,
   }));
-  const file =
-    todos.data && workspace
-      ? workspaceFile(todos.data, workspace.projectId, workspace.projectRootPath)
-      : null;
+  const file = resolveWorkspaceFile(todos.data, workspaceId, workspace);
 
   if (!file) {
     return (
@@ -1353,6 +1539,53 @@ const styles = StyleSheet.create({
     flex: 1,
     flexDirection: "row",
     alignItems: "center",
+    gap: 6,
+  },
+  rowTitle: {
+    flex: 1,
+    gap: 2,
+  },
+  itemNote: {
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  chevronButton: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  rowExpand: {
+    overflow: "hidden",
+  },
+  rowPanel: {
+    paddingLeft: 40,
+    paddingRight: 12,
+    paddingBottom: 10,
+  },
+  noteInput: {
+    minHeight: 96,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 10,
+    paddingTop: 8,
+    paddingBottom: 30,
+    fontSize: 12.5,
+    lineHeight: 17,
+    textAlignVertical: "top",
+  },
+  noteDelete: {
+    position: "absolute",
+    right: 18,
+    bottom: 16,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  rowActionText: {
+    fontSize: 12,
+    fontWeight: "500",
   },
   checkboxHit: {
     alignItems: "center",
@@ -1375,13 +1608,6 @@ const styles = StyleSheet.create({
     padding: 0,
     paddingVertical: 0,
     margin: 0,
-  },
-  deleteButton: {
-    width: 22,
-    height: 22,
-    alignItems: "center",
-    justifyContent: "center",
-    opacity: 0.7,
   },
   completedBar: {
     paddingHorizontal: 12,

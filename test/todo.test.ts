@@ -65,7 +65,7 @@ const fileFor = (projectId: string | null, ...doneFlags: boolean[]): TodoFile =>
   workspaceId: null,
   label: projectId ?? "Global",
   path: projectId === null ? join(HOME, "TODO.md") : join(ROOT, "TODO.md"),
-  items: doneFlags.map((done, index) => ({ index, text: `t${index}`, done })),
+  items: doneFlags.map((done, index) => ({ index, text: `t${index}`, done, note: "" })),
 });
 
 describe("visibleTodoFiles", () => {
@@ -73,6 +73,7 @@ describe("visibleTodoFiles", () => {
     const files = visibleTodoFiles({
       global: fileFor(null, false),
       projects: [fileFor(P, true), fileFor("p2"), fileFor("p3", false, true)],
+      homeProjectIds: [],
     });
     assert.deepEqual(
       files.map((file) => file.projectId),
@@ -84,6 +85,19 @@ describe("visibleTodoFiles", () => {
     const files = visibleTodoFiles({
       global: fileFor(null),
       projects: [fileFor(P, true, true)],
+      homeProjectIds: [],
+    });
+    assert.deepEqual(
+      files.map((file) => file.projectId),
+      [null, P],
+    );
+  });
+
+  test("a project whose file failed to read still shows so the error is visible", () => {
+    const files = visibleTodoFiles({
+      global: fileFor(null),
+      projects: [{ ...fileFor(P), error: "EISDIR" }],
+      homeProjectIds: [],
     });
     assert.deepEqual(
       files.map((file) => file.projectId),
@@ -95,6 +109,7 @@ describe("visibleTodoFiles", () => {
     const files = visibleTodoFiles({
       global: fileFor(null),
       projects: [fileFor(P), fileFor("p2")],
+      homeProjectIds: [],
     });
     assert.deepEqual(
       files.map((file) => file.projectId),
@@ -112,6 +127,8 @@ const edit = (index: number, text: string, newText: string) =>
   server.editTodoHandler({ projectId: P, index, text, newText }, ctx);
 const remove = (index?: number, text?: string) =>
   server.removeTodoHandler({ projectId: P, index, text }, ctx);
+const setNote = (index: number, text: string, note: string) =>
+  server.noteTodoHandler({ projectId: P, index, text, note }, ctx);
 const itemsOf = async () => (await server.listTodosHandler({}, ctx)).projects[0].items;
 
 beforeEach(() => {
@@ -163,6 +180,12 @@ describe("line endings", () => {
     await add("b");
     assert.equal(read(), "- [ ] a\n- [ ] b\n");
   });
+
+  test("appends use the dominant line ending, not the first one", async () => {
+    writeFileSync(FILE, "# h\n- [ ] a\r\n- [ ] b\r\n- [ ] c");
+    await add("d");
+    assert.equal(read(), "# h\n- [ ] a\r\n- [ ] b\r\n- [ ] c\r\n- [ ] d\r\n");
+  });
 });
 
 describe("edit", () => {
@@ -201,6 +224,108 @@ describe("edit", () => {
   test("edit never creates a missing file", async () => {
     await assert.rejects(edit(0, "a", "b"), /changed on disk/);
     assert.equal(existsSync(FILE), false);
+  });
+});
+
+describe("note", () => {
+  test("notes are written indented under the task and read back", async () => {
+    writeFileSync(FILE, "- [ ] alpha\n- [ ] beta\n");
+    await setNote(0, "alpha", "first\nsecond");
+    assert.equal(read(), "- [ ] alpha\n  first\n  second\n- [ ] beta\n");
+    const items = await itemsOf();
+    assert.equal(items[0].note, "first\nsecond");
+    assert.equal(items[1].note, "");
+  });
+
+  test("replacing and clearing a note rewrites the indented block", async () => {
+    writeFileSync(FILE, "- [ ] alpha\n  old\n- [ ] beta\n");
+    await setNote(0, "alpha", "new");
+    assert.equal(read(), "- [ ] alpha\n  new\n- [ ] beta\n");
+    await setNote(0, "alpha", "");
+    assert.equal(read(), "- [ ] alpha\n- [ ] beta\n");
+  });
+
+  test("note on a nested task indents one level deeper", async () => {
+    writeFileSync(FILE, "- [ ] top\n  - [ ] nested\n");
+    await setNote(1, "nested", "deep");
+    assert.equal(read(), "- [ ] top\n  - [ ] nested\n    deep\n");
+  });
+
+  test("notes survive toggle and title edit; removing a task removes its note", async () => {
+    writeFileSync(FILE, "- [ ] alpha\n  note\n- [ ] beta\n");
+    await toggle(0, "alpha");
+    await edit(0, "alpha", "alpha2");
+    assert.equal(read(), "- [x] alpha2\n  note\n- [ ] beta\n");
+    await remove(0, "alpha2");
+    assert.equal(read(), "- [ ] beta\n");
+  });
+
+  test("clear completed drops notes under completed tasks only", async () => {
+    writeFileSync(FILE, "- [x] a\n  note a\n- [ ] b\n  note b\n");
+    await remove();
+    assert.equal(read(), "- [ ] b\n  note b\n");
+  });
+
+  test("a checkbox-shaped note line stays a note and never becomes a task", async () => {
+    writeFileSync(FILE, "- [ ] alpha\n- [ ] beta\n");
+    await setNote(0, "alpha", "- [ ] check CI");
+    const items = await itemsOf();
+    assert.equal(items.length, 2);
+    assert.equal(items[0].note, "- [ ] check CI");
+    assert.equal(items[1].note, "");
+    // The note is still reachable and replaceable; clearing removes the line.
+    await setNote(0, "alpha", "plain");
+    assert.equal((await itemsOf())[0].note, "plain");
+    await setNote(0, "alpha", "");
+    assert.equal(read(), "- [ ] alpha\n- [ ] beta\n");
+  });
+
+  test("a multi-line note mixing checkbox and plain lines stays one note", async () => {
+    writeFileSync(FILE, "- [ ] alpha\n- [ ] beta\n");
+    await setNote(0, "alpha", "- [ ] check CI\nplain line\n- [x] done thing");
+    const items = await itemsOf();
+    assert.equal(items.length, 2);
+    assert.equal(items[0].note, "- [ ] check CI\nplain line\n- [x] done thing");
+    assert.equal(items[1].text, "beta");
+  });
+
+  test("note on the last task of a file without a trailing newline", async () => {
+    writeFileSync(FILE, "- [ ] alpha");
+    await setNote(0, "alpha", "tail note");
+    assert.equal(read(), "- [ ] alpha\n  tail note\n");
+    assert.equal((await itemsOf())[0].note, "tail note");
+  });
+
+  test("note on a CRLF file keeps CRLF", async () => {
+    writeFileSync(FILE, "- [ ] alpha\r\n- [ ] beta\r\n");
+    await setNote(0, "alpha", "first\r\nsecond");
+    assert.equal(read(), "- [ ] alpha\r\n  first\r\n  second\r\n- [ ] beta\r\n");
+    assert.equal((await itemsOf())[0].note, "first\nsecond");
+  });
+
+  test("stale text is refused and a no-op does not touch the file", async () => {
+    writeFileSync(FILE, "- [ ] a\n  same\n");
+    await assert.rejects(setNote(0, "nope", "x"), /changed on disk/);
+    const before = statSync(FILE).ino;
+    await setNote(0, "a", "same\n");
+    assert.equal(statSync(FILE).ino, before);
+  });
+});
+
+describe("whitespace-only note lines", () => {
+  test("a whitespace-only line does not strand the indented lines below it", async () => {
+    writeFileSync(FILE, "- [ ] a\n   \n  ghost\n- [ ] b\n");
+    // The blank-ish line and the line under it belong to a's note block.
+    assert.equal((await itemsOf())[0].note, "ghost");
+    await remove(0, "a");
+    assert.equal(read(), "- [ ] b\n");
+  });
+
+  test("setting a note rewrites whitespace-only lines in the block", async () => {
+    writeFileSync(FILE, "- [ ] a\n  first\n   \n  second\n- [ ] b\n");
+    assert.equal((await itemsOf())[0].note, "first\nsecond");
+    await setNote(0, "a", "new");
+    assert.equal(read(), "- [ ] a\n  new\n- [ ] b\n");
   });
 });
 
@@ -367,6 +492,16 @@ describe("list", () => {
     assert.equal(missing.workspaceId, "w2");
     rmSync(other, { recursive: true, force: true });
   });
+
+  test("a TODO.md that cannot be read errors only that file", async () => {
+    mkdirSync(FILE); // A directory, so readFile fails with EISDIR.
+    const list = await server.listTodosHandler({}, ctx);
+    assert.equal(list.projects.length, 1);
+    assert.deepEqual(list.projects[0].items, []);
+    assert.match(list.projects[0].error ?? "", /EISDIR|directory/i);
+    assert.deepEqual(list.global.items, []);
+    assert.equal(list.global.error, undefined);
+  });
 });
 
 describe("path resolution", () => {
@@ -393,5 +528,20 @@ describe("path resolution", () => {
     const list = await server.listTodosHandler({}, ctx);
     assert.equal(list.projects.length, 0);
     assert.deepEqual(list.global.items.map((item) => item.text), ["h"]);
+  });
+
+  test("a project rooted at a symlink to ~ uses ~/TODO.md and reports homeProjectIds", async () => {
+    const globalFile = join(HOME, "TODO.md");
+    rmSync(globalFile, { force: true });
+    const link = join(SANDBOX, "home-link");
+    rmSync(link, { force: true });
+    symlinkSync(HOME, link);
+    projects = [{ projectId: "h", projectRootPath: link, projectDisplayName: "Home" }];
+    await add("via link", "h");
+    assert.equal(readFileSync(globalFile, "utf8"), "- [ ] via link\n");
+    const list = await server.listTodosHandler({}, ctx);
+    assert.deepEqual(list.projects, []);
+    assert.deepEqual(list.homeProjectIds, ["h"]);
+    rmSync(link);
   });
 });
