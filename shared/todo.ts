@@ -25,6 +25,15 @@ export function normalizeTaskText(text: string): string {
   return text.replace(/\s*[\r\n\u2028\u2029]+\s*/g, " ").trim();
 }
 
+/**
+ * Files shown on the main TODO screen: the global list always, and only
+ * projects that have at least one task. Taskless projects stay available as
+ * add targets and reappear once their first task lands.
+ */
+export function visibleTodoFiles(data: TodoListData): TodoFile[] {
+  return [data.global, ...data.projects.filter((file) => file.items.length > 0)];
+}
+
 export const listTodos = defineRpc({
   name: "todo.list",
   input: z.object({}),

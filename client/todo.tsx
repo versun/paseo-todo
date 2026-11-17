@@ -26,6 +26,7 @@ import {
   normalizeTaskText,
   removeTodo,
   toggleTodo,
+  visibleTodoFiles,
   type TodoFile,
   type TodoItem,
   type TodoListData,
@@ -199,7 +200,6 @@ function useTodos() {
       }),
     remove: (file: TodoFile, index: number, text: string) =>
       remove.mutate({ projectId: file.projectId, index, text }),
-    clearCompleted: (file: TodoFile) => remove.mutate({ projectId: file.projectId }),
   };
 }
 
@@ -282,7 +282,7 @@ function TodoRow({
     }
   }
 
-  // Never let an unmount blur (e.g. Clear or filter switch) fire a stale edit.
+  // Never let an unmount blur (e.g. a removed row or filter switch) fire a stale edit.
   useLayoutEffect(
     () => () => {
       committed.current = true;
@@ -532,16 +532,6 @@ function TodoSection({
                     Completed · {doneItems.length}
                   </Text>
                 </Pressable>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="Clear completed tasks"
-                  hitSlop={6}
-                  onPress={() => todos.clearCompleted(file)}
-                >
-                  <Text style={[styles.completedText, { color: theme.colors.foregroundMuted }]}>
-                    Clear
-                  </Text>
-                </Pressable>
               </View>
               {showDone
                 ? doneItems.map((item, idx) => renderRow(item, idx === doneItems.length - 1))
@@ -748,9 +738,9 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
   const { data } = todos;
 
   const files = data ? [data.global, ...data.projects] : [];
-  // Every list is shown, including projects with no TODO.md yet — their
-  // section still offers the add input, and the first add creates the file.
-  const visibleFiles = files.filter(
+  // The screen hides projects with no tasks; they stay in the composer's
+  // target picker so the first add can still create their TODO.md.
+  const visibleFiles = (data ? visibleTodoFiles(data) : []).filter(
     (file) => filter === "all" || (file.projectId === null) === (filter === "global"),
   );
   const totalOpen = openCount(files);

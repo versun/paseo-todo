@@ -13,8 +13,8 @@ See [OVERVIEW.md](OVERVIEW.md) for the full feature description.
 - Composer pill that appears when the workspace's project has open tasks:
   shows the count, lets you check them off, and opens the Explorer tab
 - `/todo [task]` slash command and Command Center actions
-- Markdown checkboxes (`- [ ] task`): check, inline edit, delete, clear
-  completed — edits preserve the rest of the file and its line endings
+- Markdown checkboxes (`- [ ] task`): check, inline edit, delete — edits
+  preserve the rest of the file and its line endings
 
 ## Development
 

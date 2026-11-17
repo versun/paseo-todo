@@ -54,6 +54,55 @@ const ctx = {
 } as unknown as PluginHandlerContext;
 
 const P = "p1";
+
+// Pure client helper tested here so the screen's "no empty projects" rule
+// cannot regress. The server tests below keep exercising the RPC layer.
+const { visibleTodoFiles } = await import("../shared/todo");
+type TodoFile = import("../shared/todo").TodoFile;
+
+const fileFor = (projectId: string | null, ...doneFlags: boolean[]): TodoFile => ({
+  projectId,
+  workspaceId: null,
+  label: projectId ?? "Global",
+  path: projectId === null ? join(HOME, "TODO.md") : join(ROOT, "TODO.md"),
+  items: doneFlags.map((done, index) => ({ index, text: `t${index}`, done })),
+});
+
+describe("visibleTodoFiles", () => {
+  test("projects without tasks are hidden; global and non-empty projects stay", () => {
+    const files = visibleTodoFiles({
+      global: fileFor(null, false),
+      projects: [fileFor(P, true), fileFor("p2"), fileFor("p3", false, true)],
+    });
+    assert.deepEqual(
+      files.map((file) => file.projectId),
+      [null, P, "p3"],
+    );
+  });
+
+  test("a project whose tasks are all completed still shows", () => {
+    const files = visibleTodoFiles({
+      global: fileFor(null),
+      projects: [fileFor(P, true, true)],
+    });
+    assert.deepEqual(
+      files.map((file) => file.projectId),
+      [null, P],
+    );
+  });
+
+  test("global still shows when every list is empty", () => {
+    const files = visibleTodoFiles({
+      global: fileFor(null),
+      projects: [fileFor(P), fileFor("p2")],
+    });
+    assert.deepEqual(
+      files.map((file) => file.projectId),
+      [null],
+    );
+  });
+});
+
 const read = () => readFileSync(FILE, "utf8");
 const add = (text: string, projectId: string | null = P) =>
   server.addTodoHandler({ projectId, text }, ctx);
