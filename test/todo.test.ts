@@ -32,10 +32,17 @@ type FakeProject = { projectId: string; projectRootPath: string; projectDisplayN
 
 let projects: FakeProject[] = [];
 let listDelays: number[] = [];
+let workspaceEntries: Array<{
+  id: string;
+  projectId: string;
+  archivingAt?: null;
+  internal?: boolean;
+  background?: boolean;
+}> = [];
 
 const ctx = {
   paseo: {
-    workspaces: { list: async () => ({ entries: [] }) },
+    workspaces: { list: async () => ({ entries: workspaceEntries }) },
     projects: {
       list: async () => {
         const delay = listDelays.shift() ?? 0;
@@ -63,6 +70,7 @@ beforeEach(() => {
   mkdirSync(ROOT);
   projects = [{ projectId: P, projectRootPath: ROOT, projectDisplayName: "P1" }];
   listDelays = [];
+  workspaceEntries = [];
 });
 
 after(() => {
@@ -272,6 +280,12 @@ describe("atomic write", () => {
 });
 
 describe("add", () => {
+  test("adding to a project without TODO.md creates the file", async () => {
+    assert.equal(existsSync(FILE), false);
+    await add("first");
+    assert.equal(read(), "- [ ] first\n");
+  });
+
   test("embedded newlines are collapsed into one task", async () => {
     await add("one\r\n- [ ] two\nthree");
     assert.equal(read(), "- [ ] one - [ ] two three\n");
@@ -285,8 +299,31 @@ describe("add", () => {
   });
 });
 
+describe("list", () => {
+  test("projects without TODO.md are listed with empty items", async () => {
+    const other = join(SANDBOX, "other");
+    mkdirSync(other, { recursive: true });
+    projects = [
+      { projectId: P, projectRootPath: ROOT, projectDisplayName: "P1" },
+      { projectId: "p2", projectRootPath: other, projectDisplayName: "P2" },
+    ];
+    writeFileSync(FILE, "- [ ] a\n");
+    workspaceEntries = [{ id: "w2", projectId: "p2" }];
+    const list = await server.listTodosHandler({}, ctx);
+    assert.equal(list.projects.length, 2);
+    const missing = list.projects.find((file) => file.projectId === "p2");
+    assert.ok(missing);
+    assert.deepEqual(missing.items, []);
+    assert.equal(missing.path, join(other, "TODO.md"));
+    assert.equal(missing.workspaceId, "w2");
+    rmSync(other, { recursive: true, force: true });
+  });
+});
+
 describe("path resolution", () => {
   test("global add writes to ~/TODO.md", async () => {
+    rmSync(join(HOME, "TODO.md"), { force: true });
+    assert.equal(existsSync(join(HOME, "TODO.md")), false);
     await add("g", null);
     assert.equal(readFileSync(join(HOME, "TODO.md"), "utf8"), "- [ ] g\n");
   });
