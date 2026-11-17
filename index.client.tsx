@@ -1,5 +1,11 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
-import { TodoScreen, TodoSidebarItem, WorkspaceTodosPanel } from "./client/todo";
+import {
+  contributeComposerPills,
+  refreshTodoPills,
+  TodoScreen,
+  TodoSidebarItem,
+  WorkspaceTodosPanel,
+} from "./client/todo";
 import { addTodo } from "./shared/todo";
 
 export default function contribute(client: PluginClientContext) {
@@ -41,11 +47,14 @@ export default function contribute(client: PluginClientContext) {
       const text = args.trim();
       // Open the panel even when the add fails; the error still propagates.
       try {
-        if (text) await rpc(addTodo, { projectId: workspace.projectId, text });
+        if (text) {
+          await rpc(addTodo, { projectId: workspace.projectId, text });
+          refreshTodoPills();
+        }
       } finally {
         openPanel("todos", { location: "explorer" });
       }
     },
   });
-  return () => {};
+  return contributeComposerPills(client);
 }

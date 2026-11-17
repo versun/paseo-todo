@@ -1,6 +1,6 @@
 TODO keeps task lists in plain Markdown `TODO.md` files: one global list in `~/TODO.md` and one per project in `<project root>/TODO.md`, on the daemon machine.
 
-The TODO screen (sidebar) shows every list that has tasks, filtered by All, Global, or Projects, with overall progress. Add tasks from the field at the bottom; pick its target with the chips above it (Global by default, or any project, even one with no tasks yet). The Explorer TODO tab shows the current workspace's project list. `/todo [task]` adds a task to the current workspace's project and opens that tab. Command Center has actions for both views.
+The TODO screen (sidebar) shows every list that has tasks, filtered by All, Global, or Projects, with overall progress. Add tasks from the field at the bottom; pick its target with the chips above it (Global by default, or any project, even one with no tasks yet). The Explorer TODO tab shows the current workspace's project list. When the current workspace's project has open tasks, a composer pill appears above the chat input; press it to check off open tasks or open the Explorer TODO tab. `/todo [task]` adds a task to the current workspace's project and opens that tab. Command Center has actions for both views.
 
 Items are Markdown checkboxes (`- [ ] task`). Press the checkbox to check it off, press the task text to edit it in place, use × to delete it, and Clear to remove the completed tasks of a list. Completed tasks are collapsed under each list. Views refresh every couple of seconds.
 

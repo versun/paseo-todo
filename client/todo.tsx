@@ -1,4 +1,7 @@
 import type {
+  PluginButtonContentProps,
+  PluginButtonRegistration,
+  PluginClientContext,
   PluginScreenProps,
   PluginSidebarItemProps,
   PluginWorkspacePanelProps,
@@ -36,6 +39,25 @@ const GLOBAL_TARGET = { projectId: null, label: "Global" };
 type TodoTheme = PluginScreenProps["theme"];
 type TodoTarget = Pick<TodoFile, "projectId" | "label">;
 type FilterMode = "all" | "global" | "projects";
+type WorkspaceRef = { projectId: string; projectRootPath: string };
+
+const dataListeners = new Set<(data: TodoListData) => void>();
+let latestTodoData: TodoListData | undefined;
+let lastFetchAt = 0;
+let activeMutations = 0;
+// Bumped when a mutation starts so a fetch that began earlier cannot publish
+// pre-mutation data once the mutation settles.
+let mutationEpoch = 0;
+let recheckPills: (() => void) | null = null;
+
+function publishTodoData(data: TodoListData) {
+  latestTodoData = data;
+  for (const listener of dataListeners) listener(data);
+}
+
+export function refreshTodoPills() {
+  recheckPills?.();
+}
 
 function messageOf(error: unknown) {
   return error instanceof Error ? error.message : String(error);
@@ -70,7 +92,14 @@ function useTodoList() {
   const mutating = useIsMutating({ mutationKey: MUTATION_KEY }) > 0;
   return useQuery({
     queryKey: LIST_KEY,
-    queryFn: () => list({}),
+    queryFn: async () => {
+      lastFetchAt = Date.now();
+      const epoch = mutationEpoch;
+      const data = await list({});
+      if (activeMutations === 0 && epoch === mutationEpoch) publishTodoData(data);
+      return data;
+    },
+    initialData: () => latestTodoData,
     refetchInterval: mutating ? false : POLL_MS,
   });
 }
@@ -85,20 +114,35 @@ function useTodoMutation<Input extends { projectId: string | null }>(
     mutationKey: MUTATION_KEY,
     mutationFn,
     onMutate: async (input: Input) => {
+      activeMutations += 1;
+      mutationEpoch += 1;
       const cancel = queryClient.cancelQueries({ queryKey: LIST_KEY });
-      queryClient.setQueryData<TodoListData>(LIST_KEY, (prev) =>
-        updateFile(prev, input.projectId, (items) => optimistic(items, input)),
-      );
+      queryClient.setQueryData<TodoListData>(LIST_KEY, (prev) => {
+        const next = updateFile(prev, input.projectId, (items) => optimistic(items, input));
+        if (next && next !== prev) publishTodoData(next);
+        return next;
+      });
       await cancel;
     },
     onSuccess: () => setError(null),
     onError: (cause) => setError(messageOf(cause)),
     // Refetch only after the last overlapping mutation; an earlier refetch would
     // flash back the optimistic edits still in flight. A failed edit is undone here.
-    onSettled: () =>
-      queryClient.isMutating({ mutationKey: MUTATION_KEY }) === 1
-        ? queryClient.invalidateQueries({ queryKey: LIST_KEY })
-        : undefined,
+    onSettled: () => {
+      activeMutations = Math.max(0, activeMutations - 1);
+      if (queryClient.isMutating({ mutationKey: MUTATION_KEY }) === 1) {
+        const promise = queryClient.invalidateQueries({ queryKey: LIST_KEY });
+        // Invalidation only refetches when a mounted surface observes the list
+        // query; without one the pills would stay stale, so force the pill
+        // poll. When a surface is open its refetch publishes fresh data, so
+        // skip the duplicate RPC.
+        const observed =
+          (queryClient.getQueryCache().find({ queryKey: LIST_KEY })?.observers.length ?? 0) > 0;
+        if (!observed) recheckPills?.();
+        return promise;
+      }
+      return undefined;
+    },
   });
 }
 
@@ -828,6 +872,306 @@ function workspaceFile(data: TodoListData, projectId: string, rootPath: string):
   return rootPath.replace(/[\\/]+$/, "") === homeDir ? data.global : null;
 }
 
+function resolveWorkspaceFile(
+  data: TodoListData | undefined,
+  workspaceId: string,
+  workspace?: WorkspaceRef | null,
+): TodoFile | null {
+  if (!data) return null;
+  if (workspace) {
+    return workspaceFile(data, workspace.projectId, workspace.projectRootPath);
+  }
+  return data.projects.find((file) => file.workspaceId === workspaceId) ?? null;
+}
+
+function WorkspaceTodoPillPopover({
+  theme,
+  workspaceId,
+  close,
+  onOpenPanel,
+}: PluginButtonContentProps & {
+  onOpenPanel: (workspaceId: string) => void;
+}) {
+  const todos = useTodos();
+  const workspace = useWorkspace(workspaceId, (snapshot) => ({
+    projectId: snapshot.projectId,
+    projectRootPath: snapshot.projectRootPath,
+  }));
+  const file = resolveWorkspaceFile(todos.data, workspaceId, workspace);
+  const openItems = file ? file.items.filter((item) => !item.done) : [];
+
+  return (
+    <View style={styles.popover}>
+      {file && openItems.length > 0 ? (
+        <View
+          style={[
+            styles.card,
+            { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
+          ]}
+        >
+          {openItems.map((item, idx) => (
+            <TodoRow
+              key={item.index}
+              item={item}
+              last={idx === openItems.length - 1}
+              theme={theme}
+              onToggle={(text) => todos.toggle(file, item.index, text)}
+              onEdit={(text, newText) => todos.edit(file, item.index, text, newText)}
+              onRemove={(text) => todos.remove(file, item.index, text)}
+            />
+          ))}
+        </View>
+      ) : null}
+
+      {todos.error ? (
+        <Text style={[styles.error, { color: theme.colors.statusDanger }]}>{todos.error}</Text>
+      ) : null}
+
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Open TODO tab"
+        onPress={() => {
+          close();
+          onOpenPanel(workspaceId);
+        }}
+        style={({ pressed }) => [
+          styles.popoverSidebarButton,
+          {
+            backgroundColor: pressed ? theme.colors.surface2 : theme.colors.surface1,
+            borderColor: theme.colors.border,
+          },
+        ]}
+      >
+        <Icon name="PanelRight" size={14} color={theme.colors.foregroundMuted} />
+        <Text style={[styles.popoverSidebarButtonText, { color: theme.colors.foreground }]}>
+          Open TODO tab
+        </Text>
+      </Pressable>
+    </View>
+  );
+}
+
+export function contributeComposerPills(client: PluginClientContext) {
+  const workspaces = new Map<string, WorkspaceRef>();
+  const agents = new Map<string, { id: string; workspaceId: string }>();
+  const pills = new Map<
+    string,
+    { workspaceId: string; visible: boolean; label: string; reg: PluginButtonRegistration }
+  >();
+  const lifetime = new AbortController();
+  let stopped = false;
+  let polling = false;
+  let queuedForce = false;
+
+  const PopoverContent = (props: PluginButtonContentProps) => (
+    <WorkspaceTodoPillPopover
+      {...props}
+      onOpenPanel={(workspaceId) =>
+        client.openPanel("todos", { workspaceId, location: "explorer" })
+      }
+    />
+  );
+
+  const forgetAgent = (agentId: string) => {
+    pills.get(agentId)?.reg.remove();
+    pills.delete(agentId);
+    agents.delete(agentId);
+  };
+
+  const syncAgent = (agent: { id: string; workspaceId: string }) => {
+    if (stopped) return;
+    const file = resolveWorkspaceFile(
+      latestTodoData,
+      agent.workspaceId,
+      workspaces.get(agent.workspaceId),
+    );
+    const count = file ? openCount([file]) : 0;
+    const visible = count > 0;
+    const label = count > 0 ? `TODO · ${count}` : "TODO";
+    const existing = pills.get(agent.id);
+    if (existing && existing.workspaceId === agent.workspaceId) {
+      if (existing.visible !== visible || existing.label !== label) {
+        existing.visible = visible;
+        existing.label = label;
+        existing.reg.update({ visible, label });
+      }
+      return;
+    }
+    existing?.reg.remove();
+    const reg = client.addComposerPill({
+      id: "todos",
+      workspaceId: agent.workspaceId,
+      agentId: agent.id,
+      button: {
+        title: "TODO",
+        icon: "ListTodo",
+        label,
+        visible,
+        behavior: {
+          kind: "popover",
+          Content: PopoverContent,
+        },
+      },
+    });
+    pills.set(agent.id, { workspaceId: agent.workspaceId, visible, label, reg });
+  };
+
+  const syncAll = () => {
+    if (stopped) return;
+    for (const agent of agents.values()) syncAgent(agent);
+  };
+
+  const applyAgent = (agent: {
+    id: string;
+    workspaceId?: string | null;
+    archivedAt?: string | null;
+    internal?: boolean;
+  }) => {
+    if (stopped) return;
+    if (!agent.workspaceId || agent.archivedAt || agent.internal) {
+      forgetAgent(agent.id);
+      return;
+    }
+    const next = { id: agent.id, workspaceId: agent.workspaceId };
+    agents.set(agent.id, next);
+    syncAgent(next);
+  };
+
+  const onData = () => syncAll();
+  dataListeners.add(onData);
+
+  const poll = async (force = false) => {
+    if (stopped) return;
+    if (polling || activeMutations > 0) {
+      // Keep the forced recheck pending instead of dropping it (e.g. a `/todo`
+      // add that lands mid-poll or mid-mutation).
+      if (force) queuedForce = true;
+      return;
+    }
+    if (!force && Date.now() - lastFetchAt < POLL_MS - 200) return;
+    polling = true;
+    lastFetchAt = Date.now();
+    const epoch = mutationEpoch;
+    try {
+      const data = await client.rpc(listTodos, {});
+      if (!stopped && activeMutations === 0 && epoch === mutationEpoch) publishTodoData(data);
+    } catch {
+      // Transient RPC or reconnect errors recover on the next poll.
+    } finally {
+      polling = false;
+      if (queuedForce) {
+        queuedForce = false;
+        void poll(true);
+      }
+    }
+  };
+
+  const recheck = () => void poll(true);
+  recheckPills = recheck;
+  void poll(true);
+  const timer = setInterval(() => void poll(false), POLL_MS);
+
+  let workspaceSub: { release(): Promise<void> } | null = null;
+  let workspaceRetry: ReturnType<typeof setTimeout> | null = null;
+  let includeBackground = true;
+
+  const observeWorkspaces = () => {
+    void client.paseo.workspaces
+      .list({ includeBackground, subscribe: {} })
+      .then(({ subscription }) => {
+        if (stopped) {
+          void subscription.release();
+          return;
+        }
+        workspaceSub = subscription;
+        subscription.subscribe({
+          snapshot: ({ entries }) => {
+            workspaces.clear();
+            for (const ws of entries) {
+              if (!ws.archivingAt) {
+                workspaces.set(ws.id, {
+                  projectId: ws.projectId,
+                  projectRootPath: ws.projectRootPath,
+                });
+              }
+            }
+            syncAll();
+          },
+          update: (message) => {
+            if (message.type !== "workspace_update") return;
+            const update = message.payload;
+            if (update.kind === "remove") {
+              workspaces.delete(update.id);
+            } else if (update.workspace.archivingAt) {
+              workspaces.delete(update.workspace.id);
+            } else {
+              workspaces.set(update.workspace.id, {
+                projectId: update.workspace.projectId,
+                projectRootPath: update.workspace.projectRootPath,
+              });
+            }
+            syncAll();
+          },
+        });
+      })
+      .catch((error: unknown) => {
+        if (stopped) return;
+        if (includeBackground) {
+          // Older daemons reject `includeBackground`; retry without it.
+          includeBackground = false;
+          observeWorkspaces();
+          return;
+        }
+        console.error("[todo] workspace observation failed", error);
+        // Transient failure (e.g. reconnecting): keep retrying so pills are
+        // not permanently degraded to the `file.workspaceId` fallback.
+        workspaceRetry = setTimeout(observeWorkspaces, POLL_MS * 5);
+      });
+  };
+  observeWorkspaces();
+
+  void client.paseo.agents
+    .list({ subscribe: {}, signal: lifetime.signal })
+    .then(({ subscription }) => {
+      if (stopped) return;
+      subscription.subscribe({
+        snapshot: ({ entries }) => {
+          const seen = new Set<string>();
+          for (const { agent } of entries) {
+            seen.add(agent.id);
+            applyAgent(agent);
+          }
+          for (const agentId of [...agents.keys()]) {
+            if (!seen.has(agentId)) forgetAgent(agentId);
+          }
+        },
+        update: (message) => {
+          if (message.type !== "agent_update") return;
+          const update = message.payload;
+          if (update.kind === "remove") forgetAgent(update.agentId);
+          else applyAgent(update.agent);
+        },
+      });
+    })
+    .catch((error: unknown) => {
+      if (!lifetime.signal.aborted) console.error("[todo] agent observation failed", error);
+    });
+
+  return () => {
+    stopped = true;
+    if (recheckPills === recheck) recheckPills = null;
+    clearInterval(timer);
+    if (workspaceRetry) clearTimeout(workspaceRetry);
+    dataListeners.delete(onData);
+    lifetime.abort();
+    void workspaceSub?.release();
+    for (const pill of pills.values()) pill.reg.remove();
+    pills.clear();
+    agents.clear();
+    workspaces.clear();
+  };
+}
+
 export function WorkspaceTodosPanel({ theme, workspaceId }: PluginWorkspacePanelProps) {
   const todos = useTodos();
   const workspace = useWorkspace(workspaceId, (snapshot) => ({
@@ -1116,5 +1460,22 @@ const styles = StyleSheet.create({
   error: {
     fontSize: 12,
     paddingHorizontal: 4,
+  },
+  popover: {
+    gap: 8,
+  },
+  popoverSidebarButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  popoverSidebarButtonText: {
+    fontSize: 12.5,
+    fontWeight: "500",
   },
 });
