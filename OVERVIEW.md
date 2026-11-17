@@ -4,7 +4,7 @@ The TODO screen (sidebar) shows Global and every project that has tasks, filtere
 
 Items are Markdown checkboxes (`- [ ] task`). Press the checkbox to check it off, press the task text to edit it in place, and use × to delete it. Completed tasks are collapsed under each list. Views refresh every couple of seconds.
 
-Each row has a drag grip on the right: drag it to reorder the task inside its list, or drop it onto another project's list to move it there (the TODO screen shows every list; the Explorer tab reorders within its own). The moved task keeps its checked state and note. Dropping near a row's top or bottom edge inserts before or after it; dropping elsewhere on a list appends at the end.
+Each row has a drag grip on the left: drag it to reorder the task inside its list, or drop it onto another project's list to move it there (the TODO screen shows every list; the Explorer tab reorders within its own). The moved task keeps its checked state and note. Dropping near a row's top or bottom edge inserts before or after it; dropping elsewhere on a list appends at the end.
 
 Indented non-checkbox lines directly under a task are its note: press a task to expand its details panel and edit the note there. Notes are stored as plain text in the same `TODO.md` — note edits rewrite those indented lines, and deleting the task deletes them too.
 

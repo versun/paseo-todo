@@ -795,6 +795,27 @@ function TodoRow({
       ]}
     >
       <View style={styles.row}>
+        {drag ? (
+          <View
+            accessibilityRole="button"
+            accessibilityLabel={`Drag to reorder ${item.text}`}
+            hitSlop={6}
+            onStartShouldSetResponder={() => true}
+            onMoveShouldSetResponder={() => true}
+            onResponderGrant={(event) =>
+              drag.beginDrag(zoneKey, event.nativeEvent.pageX, event.nativeEvent.pageY)
+            }
+            onResponderMove={(event) =>
+              drag.moveDrag(event.nativeEvent.pageX, event.nativeEvent.pageY)
+            }
+            onResponderRelease={() => drag.endDrag(true)}
+            onResponderTerminate={() => drag.endDrag(false)}
+            onResponderTerminationRequest={() => false}
+            style={styles.dragHandle}
+          >
+            <Icon name="GripVertical" size={13} color={theme.colors.foregroundMuted} />
+          </View>
+        ) : null}
         <Pressable
           accessibilityRole="checkbox"
           accessibilityState={{ checked: item.done }}
@@ -888,27 +909,6 @@ function TodoRow({
             />
           </Pressable>
         </View>
-        {drag ? (
-          <View
-            accessibilityRole="button"
-            accessibilityLabel={`Drag to reorder ${item.text}`}
-            hitSlop={6}
-            onStartShouldSetResponder={() => true}
-            onMoveShouldSetResponder={() => true}
-            onResponderGrant={(event) =>
-              drag.beginDrag(zoneKey, event.nativeEvent.pageX, event.nativeEvent.pageY)
-            }
-            onResponderMove={(event) =>
-              drag.moveDrag(event.nativeEvent.pageX, event.nativeEvent.pageY)
-            }
-            onResponderRelease={() => drag.endDrag(true)}
-            onResponderTerminate={() => drag.endDrag(false)}
-            onResponderTerminationRequest={() => false}
-            style={styles.dragHandle}
-          >
-            <Icon name="GripVertical" size={13} color={theme.colors.foregroundMuted} />
-          </View>
-        ) : null}
       </View>
       <Animated.View
         style={[
@@ -924,7 +924,10 @@ function TodoRow({
         ]}
       >
         <View
-          style={styles.rowPanel}
+          // paddingLeft aligns the note under the title text: 63 when the
+          // drag handle renders (TodoDragContext present), 40 without it
+          // (e.g. WorkspaceTodoPillPopover renders rows with no provider).
+          style={[styles.rowPanel, { paddingLeft: drag ? 63 : 40 }]}
           onLayout={(event) => {
             const height = event.nativeEvent.layout.height;
             if (height !== panelHeight) setPanelHeight(height);
@@ -2044,7 +2047,6 @@ const styles = StyleSheet.create({
     overflow: "hidden",
   },
   rowPanel: {
-    paddingLeft: 40,
     paddingRight: 12,
     paddingBottom: 10,
   },
@@ -2094,8 +2096,8 @@ const styles = StyleSheet.create({
   dragHandle: {
     alignItems: "center",
     justifyContent: "center",
-    marginRight: -4,
-    paddingLeft: 4,
+    marginLeft: -4,
+    paddingRight: 4,
   },
   dragLifted: {
     opacity: 0.3,
