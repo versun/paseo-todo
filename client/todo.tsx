@@ -6,7 +6,7 @@ import type {
   PluginSidebarItemProps,
   PluginWorkspacePanelProps,
 } from "@getpaseo/plugin/client";
-import { useRpc, useWorkspace } from "@getpaseo/plugin/client";
+import { usePaseo, useRpc, useWorkspace } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, SidebarRow, TextInput } from "@getpaseo/plugin/client/ui";
 import {
   useIsMutating,
@@ -24,6 +24,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
 import {
@@ -59,6 +60,7 @@ import {
 const LIST_KEY = ["todo", "list"];
 const MUTATION_KEY = ["todo", "mutation"];
 const POLL_MS = 2000;
+const COLLAPSE_DELAY_MS = 150;
 const GLOBAL_TARGET = { projectId: null, label: "Global" };
 
 type TodoTheme = PluginScreenProps["theme"];
@@ -76,21 +78,156 @@ let activeMutations = 0;
 let mutationEpoch = 0;
 let recheckPills: (() => void) | null = null;
 
-function publishTodoData(data: TodoListData) {
-  latestTodoData = data;
-  for (const listener of dataListeners) {
+// A failing listener (e.g. pill registration) must not fail the caller or
+// starve the listeners after it.
+function notifyListeners<T>(listeners: ReadonlySet<(value: T) => void>, value: T, label: string) {
+  for (const listener of listeners) {
     try {
-      listener(data);
+      listener(value);
     } catch (error) {
-      // A failing listener (e.g. pill registration) must not fail the fetch or
-      // starve the listeners after it.
-      console.error("[todo] data listener failed", error);
+      console.error(`[todo] ${label} listener failed`, error);
     }
   }
 }
 
+function publishTodoData(data: TodoListData) {
+  latestTodoData = data;
+  notifyListeners(dataListeners, data, "data");
+}
+
 export function refreshTodoPills() {
   recheckPills?.();
+}
+
+type PaseoApi = PluginClientContext["paseo"];
+
+type WorkspaceDirEntry = WorkspaceRef & { archivingAt: string | null };
+
+/** "archived" covers both archiving-in-progress and fully removed. */
+type BoundWorkspaceStatus = "unknown" | "active" | "archived";
+
+// Real-time workspace directory shared by every surface. `workspaces.list`
+// only returns live workspaces, so once the first snapshot lands a missing id
+// means the workspace was archived or deleted.
+const workspaceDirEntries = new Map<string, WorkspaceDirEntry>();
+const workspaceDirListeners = new Set<() => void>();
+let workspaceDirReady = false;
+let workspaceDirRefs = 0;
+let workspaceDirStop: (() => void) | null = null;
+
+function notifyWorkspaceDir() {
+  notifyListeners(workspaceDirListeners, undefined, "workspace");
+}
+
+/** The entry for a workspace that can still be opened; null while archiving or gone. */
+function activeWorkspaceEntry(id: string): WorkspaceRef | null {
+  const entry = workspaceDirEntries.get(id);
+  return entry && !entry.archivingAt
+    ? { projectId: entry.projectId, projectRootPath: entry.projectRootPath }
+    : null;
+}
+
+function boundWorkspaceStatus(id: string): BoundWorkspaceStatus {
+  const entry = workspaceDirEntries.get(id);
+  if (entry) return entry.archivingAt ? "archived" : "active";
+  return workspaceDirReady ? "archived" : "unknown";
+}
+
+function subscribeWorkspaceDir(listener: () => void): () => void {
+  workspaceDirListeners.add(listener);
+  return () => {
+    workspaceDirListeners.delete(listener);
+  };
+}
+
+function startWorkspaceDirectory(paseo: PaseoApi): () => void {
+  let stopped = false;
+  let sub: { release(): Promise<void> } | null = null;
+  let retry: ReturnType<typeof setTimeout> | null = null;
+
+  const observe = () => {
+    void paseo.workspaces
+      .list({ includeBackground: true, subscribe: {} })
+      .then(({ subscription }) => {
+        if (stopped) {
+          void subscription.release();
+          return;
+        }
+        sub = subscription;
+        subscription.subscribe({
+          snapshot: ({ entries }) => {
+            workspaceDirEntries.clear();
+            for (const ws of entries) {
+              workspaceDirEntries.set(ws.id, {
+                projectId: ws.projectId,
+                projectRootPath: ws.projectRootPath,
+                archivingAt: ws.archivingAt ?? null,
+              });
+            }
+            workspaceDirReady = true;
+            notifyWorkspaceDir();
+          },
+          update: (message) => {
+            if (message.type !== "workspace_update") return;
+            const update = message.payload;
+            if (update.kind === "remove") {
+              workspaceDirEntries.delete(update.id);
+            } else {
+              workspaceDirEntries.set(update.workspace.id, {
+                projectId: update.workspace.projectId,
+                projectRootPath: update.workspace.projectRootPath,
+                archivingAt: update.workspace.archivingAt ?? null,
+              });
+            }
+            notifyWorkspaceDir();
+          },
+        });
+      })
+      .catch((error: unknown) => {
+        if (stopped) return;
+        console.error("[todo] workspace observation failed", error);
+        // Transient failure (e.g. reconnecting): keep retrying so bound
+        // workspaces are not permanently reported as archived.
+        retry = setTimeout(observe, POLL_MS * 5);
+      });
+  };
+  observe();
+
+  return () => {
+    stopped = true;
+    if (retry) clearTimeout(retry);
+    void sub?.release();
+  };
+}
+
+/** Refcounted so the directory subscription lives only while observed. */
+function acquireWorkspaceDirectory(paseo: PaseoApi): () => void {
+  if (workspaceDirRefs === 0) workspaceDirStop = startWorkspaceDirectory(paseo);
+  workspaceDirRefs += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    workspaceDirRefs -= 1;
+    if (workspaceDirRefs === 0) {
+      workspaceDirStop?.();
+      workspaceDirStop = null;
+    }
+  };
+}
+
+const noopSubscribe = () => () => {};
+
+/** Live status of a todo's bound workspace. `useWorkspace` only works inside
+ * workspace panels, so rows subscribe to the shared directory instead. */
+function useBoundWorkspaceStatus(id: string | null): BoundWorkspaceStatus {
+  const paseo = usePaseo();
+  useEffect(() => (id ? acquireWorkspaceDirectory(paseo) : undefined), [paseo, id]);
+  return useSyncExternalStore(
+    id ? subscribeWorkspaceDir : noopSubscribe,
+    () => (id ? boundWorkspaceStatus(id) : "unknown"),
+    () => "unknown",
+  );
 }
 
 function openCount(files: TodoFile[]) {
@@ -707,6 +844,7 @@ function TodoRow({
   onRemove: (text: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [editingTitle, setEditingTitle] = useState(false);
   const [draft, setDraft] = useState(item.text);
   const [draftNote, setDraftNote] = useState(item.note);
   const [noteFocused, setNoteFocused] = useState(false);
@@ -731,10 +869,20 @@ function TodoRow({
   const zoneKey = `${file.projectId ?? "global"}|${group}|${item.index}`;
   const zoneData = useLatest({ file, group, item });
   const lifted = drag?.dragging?.key === zoneKey;
+  const expandedRef = useLatest(expanded);
+  // Focus tracked in refs (not state) so blur → focus moves within the row
+  // can cancel a pending collapse without an extra render.
+  const titleFocused = useRef(false);
+  const noteFocusedRef = useRef(false);
+  const collapseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const boundWorkspaceId = item.workspaceId;
   const boundWorkspaceLabel = item.workspaceLabel ?? item.workspaceId;
+  const boundWorkspaceArchived = useBoundWorkspaceStatus(boundWorkspaceId) === "archived";
   const canOpenBoundWorkspace = Boolean(
-    boundWorkspaceId && onOpenWorkspace && boundWorkspaceId !== currentWorkspace?.id,
+    boundWorkspaceId &&
+      boundWorkspaceId !== currentWorkspace?.id &&
+      onOpenWorkspace &&
+      !boundWorkspaceArchived,
   );
 
   useLayoutEffect(() => {
@@ -772,6 +920,7 @@ function TodoRow({
     () => () => {
       committed.current = true;
       noteCommitted.current = true;
+      if (collapseTimer.current) clearTimeout(collapseTimer.current);
     },
     [],
   );
@@ -812,20 +961,66 @@ function TodoRow({
     }
   };
 
+  // Title taps edit only the title: they never open the details panel.
+  const beginTitleEdit = () => {
+    committed.current = false;
+    setDraft(currentText.current);
+    setEditingTitle(true);
+  };
+
+  const endTitleEdit = () => {
+    titleFocused.current = false;
+    commit();
+    setEditingTitle(false);
+  };
+
+  const cancelCollapse = () => {
+    if (collapseTimer.current) {
+      clearTimeout(collapseTimer.current);
+      collapseTimer.current = null;
+    }
+  };
+
+  // Idempotent close: commits both drafts and drops input focus so the
+  // keyboard goes away with the panel.
+  const collapsePanel = () => {
+    if (!expandedRef.current) return;
+    commit();
+    commitNote();
+    setEditingTitle(false);
+    titleFocused.current = false;
+    noteFocusedRef.current = false;
+    titleInputRef.current?.blur();
+    noteInputRef.current?.blur();
+    setExpanded(false);
+  };
+
+  // The delay lets a press on a panel action (delete, unlink, …) resolve
+  // before the row re-renders; touches inside the panel cancel it outright.
+  const scheduleCollapse = () => {
+    cancelCollapse();
+    collapseTimer.current = setTimeout(() => {
+      collapseTimer.current = null;
+      if (!titleFocused.current && !noteFocusedRef.current) collapsePanel();
+    }, COLLAPSE_DELAY_MS);
+  };
+
   const toggleExpanded = () => {
     if (expanded) {
-      commit();
-      commitNote();
-      // Keep the keyboard from staying up on the collapsed (height-0) inputs;
-      // the blurs' commit no-ops since the drafts were just settled above.
-      titleInputRef.current?.blur();
-      noteInputRef.current?.blur();
-      setExpanded(false);
+      collapsePanel();
     } else {
+      if (editingTitle) {
+        commit();
+        setEditingTitle(false);
+        titleInputRef.current?.blur();
+      }
       noteCommitted.current = false;
       setDraft(currentText.current);
       setDraftNote(currentNote.current);
       setExpanded(true);
+      // Focus the note so the panel owns focus; clicking anywhere outside
+      // blurs it, which collapses the panel (scheduleCollapse).
+      noteInputRef.current?.focus();
     }
   };
 
@@ -867,7 +1062,11 @@ function TodoRow({
           accessibilityLabel={`${item.done ? "Uncheck" : "Check off"} ${item.text}`}
           hitSlop={8}
           onPress={() => {
-            const text = expanded ? commit() : currentText.current;
+            const text = expanded || editingTitle ? commit() : currentText.current;
+            if (editingTitle) {
+              setEditingTitle(false);
+              titleInputRef.current?.blur();
+            }
             if (expanded) commitNote();
             onToggle(text);
           }}
@@ -888,7 +1087,7 @@ function TodoRow({
           </View>
         </Pressable>
         <View style={styles.rowMain}>
-          {expanded ? (
+          {editingTitle ? (
             <TextInput
               ref={titleInputRef}
               value={draft}
@@ -898,9 +1097,14 @@ function TodoRow({
               submitBehavior="blurAndSubmit"
               onFocus={() => {
                 committed.current = false;
+                titleFocused.current = true;
+                cancelCollapse();
               }}
-              onSubmitEditing={commit}
-              onBlur={commit}
+              onSubmitEditing={endTitleEdit}
+              onBlur={() => {
+                endTitleEdit();
+                scheduleCollapse();
+              }}
               onKeyPress={({ nativeEvent }) => {
                 if (nativeEvent.key === "Escape") {
                   // Cancel: the blur must not commit the dirty draft.
@@ -911,20 +1115,19 @@ function TodoRow({
               }}
               returnKeyType="done"
               accessibilityLabel={`Edit ${item.text}`}
-              style={[styles.itemText, styles.editInput, { color: theme.colors.foreground }]}
+              style={[styles.titleText, styles.editInput, { color: theme.colors.foreground }]}
             />
           ) : (
             <View style={styles.rowTitle}>
               <Pressable
                 accessibilityRole="button"
-                accessibilityState={{ expanded }}
-                accessibilityLabel={`Show details of ${item.text}`}
-                onPress={toggleExpanded}
+                accessibilityLabel={`Edit ${item.text}`}
+                onPress={beginTitleEdit}
                 style={styles.rowTitlePress}
               >
                 <Text
                   style={[
-                    styles.itemText,
+                    styles.titleText,
                     {
                       color: item.done ? theme.colors.foregroundMuted : theme.colors.foreground,
                       textDecorationLine: item.done ? "line-through" : "none",
@@ -933,64 +1136,87 @@ function TodoRow({
                 >
                   {item.text}
                 </Text>
-                {item.note ? (
+              </Pressable>
+              {item.note ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Show details of ${item.text}`}
+                  onPress={() => {
+                    if (!expanded) toggleExpanded();
+                  }}
+                  style={styles.rowTitlePress}
+                >
                   <Text style={[styles.itemNote, { color: theme.colors.foregroundMuted }]}>
                     {item.note}
                   </Text>
-                ) : null}
-              </Pressable>
-              {boundWorkspaceId && boundWorkspaceLabel ? (
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel={
-                    canOpenBoundWorkspace
-                      ? `Open workspace ${boundWorkspaceLabel}`
-                      : `Show details of ${item.text}`
-                  }
-                  hitSlop={4}
-                  onPress={() => {
-                    if (canOpenBoundWorkspace) onOpenWorkspace!(boundWorkspaceId);
-                    else toggleExpanded();
-                  }}
-                  style={styles.itemWorkspaceLink}
-                >
-                  <Icon
-                    name="Link2"
-                    size={11}
-                    color={
-                      canOpenBoundWorkspace ? theme.colors.accent : theme.colors.foregroundMuted
-                    }
-                  />
-                  <Text
-                    numberOfLines={1}
-                    style={[
-                      styles.itemWorkspaceText,
-                      {
-                        color: canOpenBoundWorkspace
-                          ? theme.colors.accent
-                          : theme.colors.foregroundMuted,
-                      },
-                    ]}
-                  >
-                    {boundWorkspaceLabel}
-                  </Text>
-                  {canOpenBoundWorkspace ? (
-                    <Icon name="ArrowUpRight" size={11} color={theme.colors.accent} />
-                  ) : null}
                 </Pressable>
+              ) : null}
+              {boundWorkspaceId && boundWorkspaceLabel ? (
+                canOpenBoundWorkspace ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={`Open workspace ${boundWorkspaceLabel}`}
+                    hitSlop={4}
+                    onPress={() => onOpenWorkspace!(boundWorkspaceId)}
+                    style={styles.itemWorkspaceLink}
+                  >
+                    <Icon name="Link2" size={11} color={theme.colors.accent} />
+                    <Text
+                      numberOfLines={1}
+                      style={[styles.itemWorkspaceText, { color: theme.colors.accent }]}
+                    >
+                      {boundWorkspaceLabel}
+                    </Text>
+                    <Icon name="ArrowUpRight" size={11} color={theme.colors.accent} />
+                  </Pressable>
+                ) : (
+                  <View
+                    accessibilityLabel={
+                      boundWorkspaceArchived
+                        ? `Workspace ${boundWorkspaceLabel} archived`
+                        : `Workspace ${boundWorkspaceLabel}`
+                    }
+                    style={styles.itemWorkspaceLink}
+                  >
+                    <Icon
+                      name={boundWorkspaceArchived ? "Archive" : "Link2"}
+                      size={11}
+                      color={theme.colors.foregroundMuted}
+                    />
+                    <Text
+                      numberOfLines={1}
+                      style={[
+                        styles.itemWorkspaceText,
+                        { color: theme.colors.foregroundMuted },
+                      ]}
+                    >
+                      {boundWorkspaceLabel}
+                    </Text>
+                    {boundWorkspaceArchived ? (
+                      <Text
+                        style={[
+                          styles.itemWorkspaceText,
+                          { color: theme.colors.foregroundMuted },
+                        ]}
+                      >
+                        archived
+                      </Text>
+                    ) : null}
+                  </View>
+                )
               ) : null}
             </View>
           )}
           <Pressable
             accessibilityRole="button"
             accessibilityState={{ expanded }}
-            accessibilityLabel={`${expanded ? "Hide" : "Show"} details of ${item.text}`}
+            accessibilityLabel={expanded ? `Close details of ${item.text}` : `Edit ${item.text}`}
             hitSlop={8}
             onPress={toggleExpanded}
             style={styles.chevronButton}
           >
             <Icon
-              name={expanded ? "ChevronUp" : "ChevronDown"}
+              name={expanded ? "ChevronUp" : "Pencil"}
               size={13}
               color={theme.colors.foregroundMuted}
             />
@@ -1015,6 +1241,13 @@ function TodoRow({
           // drag handle renders (TodoDragContext present), 40 without it
           // (e.g. WorkspaceTodoPillPopover renders rows with no provider).
           style={[styles.rowPanel, { paddingLeft: drag ? 63 : 40 }]}
+          onTouchStart={cancelCollapse}
+          onTouchEnd={() => {
+            // A touch inside the panel that left nothing focused (e.g. blank
+            // space) counts as losing focus; action buttons still complete
+            // because their onPress fires before the collapse delay.
+            if (!titleFocused.current && !noteFocusedRef.current) scheduleCollapse();
+          }}
           onLayout={(event) => {
             const height = event.nativeEvent.layout.height;
             if (height !== panelHeight) setPanelHeight(height);
@@ -1028,10 +1261,14 @@ function TodoRow({
             onFocus={() => {
               noteCommitted.current = false;
               setNoteFocused(true);
+              noteFocusedRef.current = true;
+              cancelCollapse();
             }}
             onBlur={() => {
               setNoteFocused(false);
+              noteFocusedRef.current = false;
               commitNote();
+              scheduleCollapse();
             }}
             onKeyPress={({ nativeEvent }) => {
               if (nativeEvent.key === "Escape") {
@@ -1120,17 +1357,32 @@ function TodoRow({
                     pressed && { backgroundColor: theme.colors.surface2 },
                   ]}
                 >
-                  <Icon name="Link2" size={12} color={theme.colors.accent} />
+                  <Icon
+                    name={boundWorkspaceArchived ? "Archive" : "Link2"}
+                    size={12}
+                    color={
+                      boundWorkspaceArchived ? theme.colors.foregroundMuted : theme.colors.accent
+                    }
+                  />
                   <Text
                     numberOfLines={1}
                     style={[
                       styles.rowActionText,
                       styles.noteLinkLabel,
-                      { color: theme.colors.accent },
+                      {
+                        color: boundWorkspaceArchived
+                          ? theme.colors.foregroundMuted
+                          : theme.colors.accent,
+                      },
                     ]}
                   >
                     {boundWorkspaceLabel}
                   </Text>
+                  {boundWorkspaceArchived ? (
+                    <Text style={[styles.rowActionText, { color: theme.colors.foregroundMuted }]}>
+                      archived
+                    </Text>
+                  ) : null}
                   <Icon name="X" size={11} color={theme.colors.foregroundMuted} />
                 </Pressable>
               )
@@ -1802,6 +2054,10 @@ function WorkspaceTodoPillPopover({
             todos={todos}
             last
             currentWorkspace={currentWorkspace}
+            onOpenWorkspace={(id) => {
+              close();
+              onOpenPanel(id);
+            }}
           />
         </View>
       ) : null}
@@ -1835,7 +2091,6 @@ function WorkspaceTodoPillPopover({
 }
 
 export function contributeComposerPills(client: PluginClientContext) {
-  const workspaces = new Map<string, WorkspaceRef>();
   const agents = new Map<string, { id: string; workspaceId: string }>();
   const pills = new Map<
     string,
@@ -1866,7 +2121,7 @@ export function contributeComposerPills(client: PluginClientContext) {
     const file = resolveWorkspaceFile(
       latestTodoData,
       agent.workspaceId,
-      workspaces.get(agent.workspaceId),
+      activeWorkspaceEntry(agent.workspaceId),
     );
     const count = file ? openCount([file]) : 0;
     const visible = count > 0;
@@ -1922,6 +2177,8 @@ export function contributeComposerPills(client: PluginClientContext) {
 
   const onData = () => syncAll();
   dataListeners.add(onData);
+  // Workspace archive/open events can change which file an agent resolves to.
+  const offWorkspaceDir = subscribeWorkspaceDir(syncAll);
 
   const poll = async (force = false) => {
     if (stopped) return;
@@ -1959,57 +2216,7 @@ export function contributeComposerPills(client: PluginClientContext) {
   void poll(true);
   const timer = setInterval(() => void poll(false), POLL_MS);
 
-  let workspaceSub: { release(): Promise<void> } | null = null;
-  let workspaceRetry: ReturnType<typeof setTimeout> | null = null;
-
-  const observeWorkspaces = () => {
-    void client.paseo.workspaces
-      .list({ includeBackground: true, subscribe: {} })
-      .then(({ subscription }) => {
-        if (stopped) {
-          void subscription.release();
-          return;
-        }
-        workspaceSub = subscription;
-        subscription.subscribe({
-          snapshot: ({ entries }) => {
-            workspaces.clear();
-            for (const ws of entries) {
-              if (!ws.archivingAt) {
-                workspaces.set(ws.id, {
-                  projectId: ws.projectId,
-                  projectRootPath: ws.projectRootPath,
-                });
-              }
-            }
-            syncAll();
-          },
-          update: (message) => {
-            if (message.type !== "workspace_update") return;
-            const update = message.payload;
-            if (update.kind === "remove") {
-              workspaces.delete(update.id);
-            } else if (update.workspace.archivingAt) {
-              workspaces.delete(update.workspace.id);
-            } else {
-              workspaces.set(update.workspace.id, {
-                projectId: update.workspace.projectId,
-                projectRootPath: update.workspace.projectRootPath,
-              });
-            }
-            syncAll();
-          },
-        });
-      })
-      .catch((error: unknown) => {
-        if (stopped) return;
-        console.error("[todo] workspace observation failed", error);
-        // Transient failure (e.g. reconnecting): keep retrying so pills are
-        // not permanently degraded to the `file.workspaceId` fallback.
-        workspaceRetry = setTimeout(observeWorkspaces, POLL_MS * 5);
-      });
-  };
-  observeWorkspaces();
+  const releaseWorkspaceDir = acquireWorkspaceDirectory(client.paseo);
 
   void client.paseo.agents
     .list({ subscribe: {}, signal: lifetime.signal })
@@ -2042,14 +2249,13 @@ export function contributeComposerPills(client: PluginClientContext) {
     stopped = true;
     if (recheckPills === recheck) recheckPills = null;
     clearInterval(timer);
-    if (workspaceRetry) clearTimeout(workspaceRetry);
     dataListeners.delete(onData);
+    offWorkspaceDir();
+    releaseWorkspaceDir();
     lifetime.abort();
-    void workspaceSub?.release();
     for (const pill of pills.values()) pill.reg.remove();
     pills.clear();
     agents.clear();
-    workspaces.clear();
   };
 }
 
@@ -2264,7 +2470,11 @@ const styles = StyleSheet.create({
     gap: 3,
   },
   rowTitlePress: {
-    gap: 2,
+    alignSelf: "flex-start",
+  },
+  titleText: {
+    fontSize: 13.5,
+    lineHeight: 19,
   },
   itemNote: {
     fontSize: 12,
@@ -2358,11 +2568,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  itemText: {
-    flex: 1,
-    fontSize: 13.5,
-    lineHeight: 19,
-  },
   dragHandle: {
     alignItems: "center",
     justifyContent: "center",
@@ -2394,6 +2599,7 @@ const styles = StyleSheet.create({
     lineHeight: 19,
   },
   editInput: {
+    flex: 1,
     padding: 0,
     margin: 0,
   },
