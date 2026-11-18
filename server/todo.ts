@@ -7,6 +7,7 @@ import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import {
   addTodo,
   editTodo,
+  linkTodo,
   listTodos,
   messageOf,
   moveTodo,
@@ -25,6 +26,7 @@ const HOME_DIR = resolve(homedir());
 const GLOBAL_FILE = join(HOME_DIR, "TODO.md");
 const PASEO_HOME = join(HOME_DIR, ".paseo");
 const CHECKBOX = /^(\s*[-*+]\s+\[)([ xX])(\]\s+)(.*?)$/;
+const WORKSPACE_LINK = /^\[([^\]]*)\]\(paseo:workspace:([^\s)]+)\)$/;
 const STALE_TASK = "This task changed on disk. Refresh and try again.";
 const PROJECTS_TIMEOUT_MS = 10_000;
 
@@ -156,6 +158,26 @@ function noteText(text: string): string {
   return trimmed.startsWith("\u200B") ? trimmed.slice(1) : trimmed;
 }
 
+/**
+ * Parse a `[label](paseo:workspace:<id>)` marker line. User-written note lines
+ * that happen to match this shape are prefixed with `\u200B` on write (like
+ * checkbox-shaped notes), so `text.trim()` here only matches real bindings.
+ */
+function parseWorkspaceLink(text: string): { workspaceId: string; workspaceLabel: string } | null {
+  const match = WORKSPACE_LINK.exec(text.trim());
+  if (!match) return null;
+  const workspaceId = match[2];
+  const workspaceLabel = match[1].trim() || workspaceId;
+  return { workspaceId, workspaceLabel };
+}
+
+function formatWorkspaceLink(workspaceId: string, workspaceLabel?: string | null): string {
+  const id = workspaceId.trim();
+  if (!id || /[\s)]/.test(id)) throw new Error("Workspace id is invalid");
+  const label = normalizeTaskText(workspaceLabel ?? "").replace(/[\[\]]/g, "").trim() || id;
+  return `[${label}](paseo:workspace:${id})`;
+}
+
 function parseItems(source: string): TodoItem[] {
   const items: TodoItem[] = [];
   const lines = splitLines(source);
@@ -163,8 +185,19 @@ function parseItems(source: string): TodoItem[] {
     const match = CHECKBOX.exec(lines[i].text);
     if (!match) continue;
     const note: string[] = [];
+    let workspaceId: string | null = null;
+    let workspaceLabel: string | null = null;
     while (i + 1 < lines.length && isNoteLine(lines[i + 1].text)) {
-      const text = noteText(lines[++i].text);
+      const raw = lines[++i].text;
+      const link = parseWorkspaceLink(raw);
+      if (link) {
+        if (workspaceId === null) {
+          workspaceId = link.workspaceId;
+          workspaceLabel = link.workspaceLabel;
+        }
+        continue;
+      }
+      const text = noteText(raw);
       if (text) note.push(text);
     }
     items.push({
@@ -172,6 +205,8 @@ function parseItems(source: string): TodoItem[] {
       text: match[4].trim(),
       done: match[2] !== " ",
       note: note.join("\n"),
+      workspaceId,
+      workspaceLabel,
     });
   }
   return items;
@@ -277,8 +312,13 @@ export async function listTodosHandler(
   ]);
 
   const activeWorkspaceByProject = new Map<string, string>();
+  const workspaceNameById = new Map<string, string>();
   for (const entry of entries) {
-    if (entry.archivingAt || entry.internal || entry.background) continue;
+    if (entry.archivingAt || entry.internal) continue;
+    // Match the client's `title || name` precedence for the display label.
+    const workspaceLabel = entry.title || entry.name;
+    if (workspaceLabel) workspaceNameById.set(entry.id, workspaceLabel);
+    if (entry.background) continue;
     if (!activeWorkspaceByProject.has(entry.projectId)) {
       activeWorkspaceByProject.set(entry.projectId, entry.id);
     }
@@ -292,7 +332,18 @@ export async function listTodosHandler(
     let pending = reads.get(path);
     if (!pending) {
       pending = readText(path)
-        .then((source): FileItems => ({ items: parseItems(source) }))
+        .then(
+          (source): FileItems => ({
+            items: parseItems(source).map((item) => {
+              const liveLabel = item.workspaceId
+                ? workspaceNameById.get(item.workspaceId)
+                : undefined;
+              return liveLabel && liveLabel !== item.workspaceLabel
+                ? { ...item, workspaceLabel: liveLabel }
+                : item;
+            }),
+          }),
+        )
         .catch((error: unknown): FileItems => ({ items: [], error: messageOf(error) }));
       reads.set(path, pending);
     }
@@ -409,33 +460,67 @@ export async function noteTodoHandler(
     const lines = splitLines(existing);
     const { line } = locateLine(lines, index, text);
     const end = noteBlockEnd(lines, line);
-    const current = lines
-      .slice(line + 1, end)
+    const block = lines.slice(line + 1, end);
+    const linkLine = block.find((entry) => parseWorkspaceLink(entry.text) !== null);
+    const current = block
+      .filter((entry) => parseWorkspaceLink(entry.text) === null)
       .map((entry) => noteText(entry.text))
       .filter(Boolean)
       .join("\n");
     if (current === next) return null; // No-op leaves the file alone.
-    if (!next) {
-      lines.splice(line + 1, end - line - 1);
-      return joinLines(lines);
-    }
     // Reuse the task's own indent + line ending; an unterminated task line gets
     // the file's dominant ending so the note lines can follow it. Indents only
     // ever inherit plain spaces/tabs, not exotic whitespace.
     const indent = `${lines[line].text.match(/^[ \t]*/)![0]}  `;
     const eol = lines[line].eol || dominantEol(lines);
+    const replacement: Line[] = [];
+    if (linkLine) {
+      replacement.push({ text: linkLine.text, eol: linkLine.eol || eol });
+    }
+    if (next) {
+      for (const noteLine of next.split("\n")) {
+        const lineText = `${indent}${noteLine}`;
+        // A note shaped like a checkbox ("- [ ] …") or a workspace link marker
+        // would re-parse as a task or binding. A zero-width space is invisible,
+        // is not `\s`, and noteText() drops it again on read.
+        const escaped = CHECKBOX.test(lineText) || WORKSPACE_LINK.test(noteLine);
+        replacement.push({ text: escaped ? `${indent}\u200B${noteLine}` : lineText, eol });
+      }
+    }
+    if (replacement.length > 0 && !lines[line].eol) lines[line].eol = eol;
+    lines.splice(line + 1, end - line - 1, ...replacement);
+    return joinLines(lines);
+  });
+}
+
+export async function linkTodoHandler(
+  { projectId, index, text, workspaceId, workspaceLabel }: RpcInput<typeof linkTodo>,
+  { paseo }: PluginHandlerContext,
+) {
+  const marker =
+    workspaceId !== null ? formatWorkspaceLink(workspaceId, workspaceLabel) : null;
+  return mutateTodoFile(paseo, projectId, (existing) => {
+    const lines = splitLines(existing);
+    const { line } = locateLine(lines, index, text);
+    const end = noteBlockEnd(lines, line);
+    const block = lines.slice(line + 1, end);
+    const linkLines = block.filter((entry) => parseWorkspaceLink(entry.text) !== null);
+    if (marker === null) {
+      if (linkLines.length === 0) return null; // Already unlinked.
+      const rest = block.filter((entry) => parseWorkspaceLink(entry.text) === null);
+      const hasNote = rest.some((entry) => noteText(entry.text) !== "");
+      lines.splice(line + 1, end - line - 1, ...(hasNote ? rest : []));
+      return joinLines(lines);
+    }
+    const indent = `${lines[line].text.match(/^[ \t]*/)![0]}  `;
+    const markerText = `${indent}${marker}`;
+    if (linkLines.length === 1 && block[0] === linkLines[0] && linkLines[0].text === markerText) {
+      return null; // No-op leaves the file alone.
+    }
+    const eol = lines[line].eol || dominantEol(lines);
     if (!lines[line].eol) lines[line].eol = eol;
-    lines.splice(
-      line + 1,
-      end - line - 1,
-      ...next.split("\n").map((noteLine) => {
-        const text = `${indent}${noteLine}`;
-        // A note shaped like a checkbox ("- [ ] …") would re-parse as a real
-        // task. A zero-width space is invisible, is not `\s` (so CHECKBOX
-        // fails), and noteText() drops it again on read.
-        return { text: CHECKBOX.test(text) ? `${indent}\u200B${noteLine}` : text, eol };
-      }),
-    );
+    const rest = block.filter((entry) => parseWorkspaceLink(entry.text) === null);
+    lines.splice(line + 1, end - line - 1, { text: markerText, eol }, ...rest);
     return joinLines(lines);
   });
 }

@@ -41,6 +41,7 @@ import {
 import {
   addTodo,
   editTodo,
+  linkTodo,
   listTodos,
   messageOf,
   moveTodo,
@@ -64,6 +65,7 @@ type TodoTheme = PluginScreenProps["theme"];
 type TodoTarget = Pick<TodoFile, "projectId" | "label">;
 type FilterMode = "all" | "global" | "projects";
 type WorkspaceRef = { projectId: string; projectRootPath: string };
+type WorkspaceBinding = { id: string; label: string };
 
 const dataListeners = new Set<(data: TodoListData) => void>();
 let latestTodoData: TodoListData | undefined;
@@ -264,6 +266,7 @@ function useTodos() {
   const toggleRpc = useRpc(toggleTodo);
   const editRpc = useRpc(editTodo);
   const noteRpc = useRpc(noteTodo);
+  const linkRpc = useRpc(linkTodo);
   const removeRpc = useRpc(removeTodo);
   const moveRpc = useRpc(moveTodo);
 
@@ -272,7 +275,14 @@ function useTodos() {
     (data, { projectId, text }) =>
       updateFile(data, projectId, (items) => [
         ...items,
-        { index: items.length, text: normalizeTaskText(text), done: false, note: "" },
+        {
+          index: items.length,
+          text: normalizeTaskText(text),
+          done: false,
+          note: "",
+          workspaceId: null,
+          workspaceLabel: null,
+        },
       ]),
     setActionError,
   );
@@ -299,6 +309,22 @@ function useTodos() {
     (data, { projectId, index, note }) =>
       updateFile(data, projectId, (items) =>
         items.map((item) => (item.index === index ? { ...item, note } : item)),
+      ),
+    setActionError,
+  );
+  const link = useTodoMutation(
+    linkRpc,
+    (data, { projectId, index, workspaceId, workspaceLabel }) =>
+      updateFile(data, projectId, (items) =>
+        items.map((item) =>
+          item.index === index
+            ? {
+                ...item,
+                workspaceId,
+                workspaceLabel: workspaceId ? (workspaceLabel ?? workspaceId) : null,
+              }
+            : item,
+        ),
       ),
     setActionError,
   );
@@ -334,6 +360,14 @@ function useTodos() {
         index,
         text,
         note: normalizeNoteText(note),
+      }),
+    link: (file: TodoFile, index: number, text: string, workspace: WorkspaceBinding | null) =>
+      link.mutate({
+        projectId: file.projectId,
+        index,
+        text,
+        workspaceId: workspace?.id ?? null,
+        workspaceLabel: workspace?.label ?? null,
       }),
     remove: (file: TodoFile, index: number, text: string) =>
       remove.mutate({ projectId: file.projectId, index, text }),
@@ -651,9 +685,12 @@ function TodoRow({
   theme,
   file,
   group,
+  currentWorkspace,
+  onOpenWorkspace,
   onToggle,
   onEdit,
   onSetNote,
+  onLink,
   onRemove,
 }: {
   item: TodoItem;
@@ -661,9 +698,12 @@ function TodoRow({
   theme: TodoTheme;
   file: TodoFile;
   group: DragGroup;
+  currentWorkspace?: WorkspaceBinding;
+  onOpenWorkspace?: (workspaceId: string) => void;
   onToggle: (text: string) => void;
   onEdit: (text: string, newText: string) => void;
   onSetNote: (text: string, note: string) => void;
+  onLink: (text: string, workspace: WorkspaceBinding | null) => void;
   onRemove: (text: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -691,6 +731,11 @@ function TodoRow({
   const zoneKey = `${file.projectId ?? "global"}|${group}|${item.index}`;
   const zoneData = useLatest({ file, group, item });
   const lifted = drag?.dragging?.key === zoneKey;
+  const boundWorkspaceId = item.workspaceId;
+  const boundWorkspaceLabel = item.workspaceLabel ?? item.workspaceId;
+  const canOpenBoundWorkspace = Boolean(
+    boundWorkspaceId && onOpenWorkspace && boundWorkspaceId !== currentWorkspace?.id,
+  );
 
   useLayoutEffect(() => {
     if (!drag) return;
@@ -869,30 +914,72 @@ function TodoRow({
               style={[styles.itemText, styles.editInput, { color: theme.colors.foreground }]}
             />
           ) : (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityState={{ expanded }}
-              accessibilityLabel={`Show details of ${item.text}`}
-              onPress={toggleExpanded}
-              style={styles.rowTitle}
-            >
-              <Text
-                style={[
-                  styles.itemText,
-                  {
-                    color: item.done ? theme.colors.foregroundMuted : theme.colors.foreground,
-                    textDecorationLine: item.done ? "line-through" : "none",
-                  },
-                ]}
+            <View style={styles.rowTitle}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityState={{ expanded }}
+                accessibilityLabel={`Show details of ${item.text}`}
+                onPress={toggleExpanded}
+                style={styles.rowTitlePress}
               >
-                {item.text}
-              </Text>
-              {item.note ? (
-                <Text style={[styles.itemNote, { color: theme.colors.foregroundMuted }]}>
-                  {item.note}
+                <Text
+                  style={[
+                    styles.itemText,
+                    {
+                      color: item.done ? theme.colors.foregroundMuted : theme.colors.foreground,
+                      textDecorationLine: item.done ? "line-through" : "none",
+                    },
+                  ]}
+                >
+                  {item.text}
                 </Text>
+                {item.note ? (
+                  <Text style={[styles.itemNote, { color: theme.colors.foregroundMuted }]}>
+                    {item.note}
+                  </Text>
+                ) : null}
+              </Pressable>
+              {boundWorkspaceId && boundWorkspaceLabel ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    canOpenBoundWorkspace
+                      ? `Open workspace ${boundWorkspaceLabel}`
+                      : `Show details of ${item.text}`
+                  }
+                  hitSlop={4}
+                  onPress={() => {
+                    if (canOpenBoundWorkspace) onOpenWorkspace!(boundWorkspaceId);
+                    else toggleExpanded();
+                  }}
+                  style={styles.itemWorkspaceLink}
+                >
+                  <Icon
+                    name="Link2"
+                    size={11}
+                    color={
+                      canOpenBoundWorkspace ? theme.colors.accent : theme.colors.foregroundMuted
+                    }
+                  />
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      styles.itemWorkspaceText,
+                      {
+                        color: canOpenBoundWorkspace
+                          ? theme.colors.accent
+                          : theme.colors.foregroundMuted,
+                      },
+                    ]}
+                  >
+                    {boundWorkspaceLabel}
+                  </Text>
+                  {canOpenBoundWorkspace ? (
+                    <Icon name="ArrowUpRight" size={11} color={theme.colors.accent} />
+                  ) : null}
+                </Pressable>
               ) : null}
-            </Pressable>
+            </View>
           )}
           <Pressable
             accessibilityRole="button"
@@ -965,25 +1052,131 @@ function TodoRow({
               },
             ]}
           />
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={`Delete ${item.text}`}
-            hitSlop={4}
-            onPress={() => {
-              committed.current = true;
-              noteCommitted.current = true;
-              onRemove(currentText.current);
-            }}
-            style={({ pressed }) => [
-              styles.noteDelete,
-              pressed && { backgroundColor: theme.colors.surface2 },
-            ]}
+          <View
+            pointerEvents="box-none"
+            style={[styles.noteActions, { left: (drag ? 63 : 40) + 6 }]}
           >
-            <Icon name="Trash2" size={12} color={theme.colors.statusDanger} />
-            <Text style={[styles.rowActionText, { color: theme.colors.statusDanger }]}>
-              Delete
-            </Text>
-          </Pressable>
+            {boundWorkspaceId && boundWorkspaceLabel ? (
+              canOpenBoundWorkspace ? (
+                <View style={styles.noteLinkGroup}>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={`Open workspace ${boundWorkspaceLabel}`}
+                    hitSlop={4}
+                    onPress={() => {
+                      commit();
+                      commitNote();
+                      onOpenWorkspace!(boundWorkspaceId);
+                    }}
+                    style={({ pressed }) => [
+                      styles.noteActionButton,
+                      styles.noteLinkOpen,
+                      pressed && { backgroundColor: theme.colors.surface2 },
+                    ]}
+                  >
+                    <Icon name="Link2" size={12} color={theme.colors.accent} />
+                    <Text
+                      numberOfLines={1}
+                      style={[
+                        styles.rowActionText,
+                        styles.noteLinkLabel,
+                        { color: theme.colors.accent },
+                      ]}
+                    >
+                      {boundWorkspaceLabel}
+                    </Text>
+                    <Icon name="ArrowUpRight" size={11} color={theme.colors.accent} />
+                  </Pressable>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={`Unlink workspace ${boundWorkspaceLabel}`}
+                    hitSlop={4}
+                    onPress={() => {
+                      const text = commit();
+                      commitNote();
+                      onLink(text, null);
+                    }}
+                    style={({ pressed }) => [
+                      styles.noteUnlinkButton,
+                      pressed && { backgroundColor: theme.colors.surface2 },
+                    ]}
+                  >
+                    <Icon name="X" size={11} color={theme.colors.foregroundMuted} />
+                  </Pressable>
+                </View>
+              ) : (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Unlink workspace ${boundWorkspaceLabel}`}
+                  hitSlop={4}
+                  onPress={() => {
+                    const text = commit();
+                    commitNote();
+                    onLink(text, null);
+                  }}
+                  style={({ pressed }) => [
+                    styles.noteActionButton,
+                    styles.noteLinkGroup,
+                    pressed && { backgroundColor: theme.colors.surface2 },
+                  ]}
+                >
+                  <Icon name="Link2" size={12} color={theme.colors.accent} />
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      styles.rowActionText,
+                      styles.noteLinkLabel,
+                      { color: theme.colors.accent },
+                    ]}
+                  >
+                    {boundWorkspaceLabel}
+                  </Text>
+                  <Icon name="X" size={11} color={theme.colors.foregroundMuted} />
+                </Pressable>
+              )
+            ) : currentWorkspace ? (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={`Link workspace ${currentWorkspace.label}`}
+                hitSlop={4}
+                onPress={() => {
+                  const text = commit();
+                  commitNote();
+                  onLink(text, currentWorkspace);
+                }}
+                style={({ pressed }) => [
+                  styles.noteActionButton,
+                  pressed && { backgroundColor: theme.colors.surface2 },
+                ]}
+              >
+                <Icon name="Link2" size={12} color={theme.colors.foregroundMuted} />
+                <Text style={[styles.rowActionText, { color: theme.colors.foregroundMuted }]}>
+                  Link workspace
+                </Text>
+              </Pressable>
+            ) : (
+              <View />
+            )}
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`Delete ${item.text}`}
+              hitSlop={4}
+              onPress={() => {
+                committed.current = true;
+                noteCommitted.current = true;
+                onRemove(currentText.current);
+              }}
+              style={({ pressed }) => [
+                styles.noteActionButton,
+                pressed && { backgroundColor: theme.colors.surface2 },
+              ]}
+            >
+              <Icon name="Trash2" size={12} color={theme.colors.statusDanger} />
+              <Text style={[styles.rowActionText, { color: theme.colors.statusDanger }]}>
+                Delete
+              </Text>
+            </Pressable>
+          </View>
         </View>
       </Animated.View>
     </View>
@@ -998,6 +1191,8 @@ function TodoRows({
   theme,
   todos,
   last,
+  currentWorkspace,
+  onOpenWorkspace,
 }: {
   items: TodoItem[];
   file: TodoFile;
@@ -1005,6 +1200,8 @@ function TodoRows({
   theme: TodoTheme;
   todos: TodoActions;
   last: boolean;
+  currentWorkspace?: WorkspaceBinding;
+  onOpenWorkspace?: (workspaceId: string) => void;
 }) {
   return items.map((item, idx) => (
     <TodoRow
@@ -1014,9 +1211,12 @@ function TodoRows({
       theme={theme}
       file={file}
       group={group}
+      currentWorkspace={currentWorkspace}
+      onOpenWorkspace={onOpenWorkspace}
       onToggle={(text) => todos.toggle(file, item.index, text)}
       onEdit={(text, newText) => todos.edit(file, item.index, text, newText)}
       onSetNote={(text, note) => todos.setNote(file, item.index, text, note)}
+      onLink={(text, workspace) => todos.link(file, item.index, text, workspace)}
       onRemove={(text) => todos.remove(file, item.index, text)}
     />
   ));
@@ -1027,13 +1227,15 @@ function TodoSection({
   theme,
   todos,
   compactHeader = false,
+  currentWorkspace,
   onOpenWorkspace,
 }: {
   file: TodoFile;
   theme: TodoTheme;
   todos: TodoActions;
   compactHeader?: boolean;
-  onOpenWorkspace?: () => void;
+  currentWorkspace?: WorkspaceBinding;
+  onOpenWorkspace?: (workspaceId: string) => void;
 }) {
   const [showDone, setShowDone] = useState(false);
   const openItems = file.items.filter((item) => !item.done);
@@ -1113,12 +1315,12 @@ function TodoSection({
           ) : (
             <Icon name="CheckCircle2" size={15} color={theme.colors.statusSuccess} />
           )}
-          {onOpenWorkspace ? (
+          {file.workspaceId && onOpenWorkspace ? (
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={`Open ${file.label}`}
               hitSlop={6}
-              onPress={onOpenWorkspace}
+              onPress={() => onOpenWorkspace(file.workspaceId!)}
               style={[styles.openWorkspaceButton, { borderColor: theme.colors.border }]}
             >
               <Icon name="ArrowUpRight" size={13} color={theme.colors.foregroundMuted} />
@@ -1145,6 +1347,8 @@ function TodoSection({
             theme={theme}
             todos={todos}
             last={doneItems.length === 0}
+            currentWorkspace={currentWorkspace}
+            onOpenWorkspace={onOpenWorkspace}
           />
           {doneItems.length > 0 ? (
             <View>
@@ -1183,6 +1387,8 @@ function TodoSection({
                   theme={theme}
                   todos={todos}
                   last
+                  currentWorkspace={currentWorkspace}
+                  onOpenWorkspace={onOpenWorkspace}
                 />
               ) : null}
             </View>
@@ -1504,22 +1710,17 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
 
         {data ? (
           visibleFiles.length > 0 ? (
-            visibleFiles.map((file) => {
-              const workspaceId = file.workspaceId;
-              return (
-                <TodoSection
-                  key={file.projectId ?? "global"}
-                  file={file}
-                  theme={theme}
-                  todos={todos}
-                  onOpenWorkspace={
-                    workspaceId && navigation
-                      ? () => navigation.openWorkspace({ workspaceId })
-                      : undefined
-                  }
-                />
-              );
-            })
+            visibleFiles.map((file) => (
+              <TodoSection
+                key={file.projectId ?? "global"}
+                file={file}
+                theme={theme}
+                todos={todos}
+                onOpenWorkspace={
+                  navigation ? (workspaceId) => navigation.openWorkspace({ workspaceId }) : undefined
+                }
+              />
+            ))
           ) : (
             <EmptyCard theme={theme} text="No lists yet — add a task below to create one." />
           )
@@ -1574,11 +1775,15 @@ function WorkspaceTodoPillPopover({
 }) {
   const todos = useTodos();
   const workspace = useWorkspace(workspaceId, (snapshot) => ({
+    name: snapshot.title || snapshot.name,
     projectId: snapshot.projectId,
     projectRootPath: snapshot.projectRootPath,
   }));
   const file = resolveWorkspaceFile(todos.data, workspaceId, workspace);
   const openItems = file ? file.items.filter((item) => !item.done) : [];
+  const currentWorkspace = file
+    ? { id: workspaceId, label: workspace?.name || file.label }
+    : undefined;
 
   return (
     <View style={styles.popover}>
@@ -1589,7 +1794,15 @@ function WorkspaceTodoPillPopover({
             { backgroundColor: theme.colors.surface1, borderColor: theme.colors.border },
           ]}
         >
-          <TodoRows items={openItems} file={file} group="open" theme={theme} todos={todos} last />
+          <TodoRows
+            items={openItems}
+            file={file}
+            group="open"
+            theme={theme}
+            todos={todos}
+            last
+            currentWorkspace={currentWorkspace}
+          />
         </View>
       ) : null}
 
@@ -1840,9 +2053,14 @@ export function contributeComposerPills(client: PluginClientContext) {
   };
 }
 
-export function WorkspaceTodosPanel({ theme, workspaceId }: PluginWorkspacePanelProps) {
+export function WorkspaceTodosPanel({
+  theme,
+  workspaceId,
+  navigation,
+}: PluginWorkspacePanelProps) {
   const todos = useTodos();
   const workspace = useWorkspace(workspaceId, (snapshot) => ({
+    name: snapshot.title || snapshot.name,
     projectId: snapshot.projectId,
     projectRootPath: snapshot.projectRootPath,
   }));
@@ -1865,7 +2083,17 @@ export function WorkspaceTodosPanel({ theme, workspaceId }: PluginWorkspacePanel
         contentContainerStyle={styles.panelContent}
         keyboardShouldPersistTaps="handled"
       >
-        <TodoSection key={file.path} file={file} theme={theme} todos={todos} compactHeader />
+        <TodoSection
+          key={file.path}
+          file={file}
+          theme={theme}
+          todos={todos}
+          compactHeader
+          currentWorkspace={{ id: workspaceId, label: workspace?.name || file.label }}
+          onOpenWorkspace={
+            navigation ? (id) => navigation.openWorkspace({ workspaceId: id }) : undefined
+          }
+        />
       </ScrollView>
       <TodoBottomComposer
         theme={theme}
@@ -2033,11 +2261,27 @@ const styles = StyleSheet.create({
   },
   rowTitle: {
     flex: 1,
+    gap: 3,
+  },
+  rowTitlePress: {
     gap: 2,
   },
   itemNote: {
     fontSize: 12,
     lineHeight: 16,
+  },
+  itemWorkspaceLink: {
+    flexDirection: "row",
+    alignItems: "center",
+    alignSelf: "flex-start",
+    gap: 4,
+    maxWidth: "100%",
+  },
+  itemWorkspaceText: {
+    fontSize: 11.5,
+    lineHeight: 15,
+    fontWeight: "500",
+    flexShrink: 1,
   },
   chevronButton: {
     alignItems: "center",
@@ -2061,16 +2305,42 @@ const styles = StyleSheet.create({
     lineHeight: 17,
     textAlignVertical: "top",
   },
-  noteDelete: {
+  noteActions: {
     position: "absolute",
     right: 18,
     bottom: 16,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  noteActionButton: {
     flexDirection: "row",
     alignItems: "center",
     gap: 4,
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 6,
+  },
+  noteLinkGroup: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexShrink: 1,
+    minWidth: 0,
+  },
+  noteLinkOpen: {
+    paddingRight: 4,
+    flexShrink: 1,
+  },
+  noteLinkLabel: {
+    flexShrink: 1,
+  },
+  noteUnlinkButton: {
+    paddingHorizontal: 5,
+    paddingVertical: 4,
+    borderRadius: 6,
+    alignItems: "center",
+    justifyContent: "center",
   },
   rowActionText: {
     fontSize: 12,

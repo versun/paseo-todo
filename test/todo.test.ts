@@ -35,6 +35,8 @@ let listDelays: number[] = [];
 let workspaceEntries: Array<{
   id: string;
   projectId: string;
+  name?: string;
+  title?: string | null;
   archivingAt?: null;
   internal?: boolean;
   background?: boolean;
@@ -65,7 +67,14 @@ const fileFor = (projectId: string | null, ...doneFlags: boolean[]): TodoFile =>
   workspaceId: null,
   label: projectId ?? "Global",
   path: projectId === null ? join(HOME, "TODO.md") : join(ROOT, "TODO.md"),
-  items: doneFlags.map((done, index) => ({ index, text: `t${index}`, done, note: "" })),
+  items: doneFlags.map((done, index) => ({
+    index,
+    text: `t${index}`,
+    done,
+    note: "",
+    workspaceId: null,
+    workspaceLabel: null,
+  })),
 });
 
 describe("visibleTodoFiles", () => {
@@ -129,6 +138,12 @@ const remove = (index: number, text: string) =>
   server.removeTodoHandler({ projectId: P, index, text }, ctx);
 const setNote = (index: number, text: string, note: string) =>
   server.noteTodoHandler({ projectId: P, index, text, note }, ctx);
+const link = (
+  index: number,
+  text: string,
+  workspaceId: string | null,
+  workspaceLabel?: string | null,
+) => server.linkTodoHandler({ projectId: P, index, text, workspaceId, workspaceLabel }, ctx);
 const move = (index: number, text: string, toIndex: number, from: string | null = P, to: string | null = P) =>
   server.moveTodoHandler({ projectId: from, index, text, toProjectId: to, toIndex }, ctx);
 const itemsOf = async () => (await server.listTodosHandler({}, ctx)).projects[0].items;
@@ -643,3 +658,123 @@ describe("path resolution", () => {
     rmSync(link);
   });
 });
+
+describe("workspace link", () => {
+  test("links, re-links and unlinks a task as a Markdown link in its note block", async () => {
+    writeFileSync(FILE, "- [ ] alpha\n- [ ] beta\n");
+    await link(0, "alpha", "wks_1", "feat-auth");
+    assert.equal(read(), "- [ ] alpha\n  [feat-auth](paseo:workspace:wks_1)\n- [ ] beta\n");
+    let items = await itemsOf();
+    assert.equal(items[0].workspaceId, "wks_1");
+    assert.equal(items[0].workspaceLabel, "feat-auth");
+    assert.equal(items[0].note, "");
+    assert.equal(items[1].workspaceId, null);
+
+    await link(0, "alpha", "wks_2", "feat-billing");
+    assert.equal(read(), "- [ ] alpha\n  [feat-billing](paseo:workspace:wks_2)\n- [ ] beta\n");
+    items = await itemsOf();
+    assert.equal(items[0].workspaceId, "wks_2");
+    assert.equal(items[0].workspaceLabel, "feat-billing");
+
+    await link(0, "alpha", null);
+    assert.equal(read(), "- [ ] alpha\n- [ ] beta\n");
+    items = await itemsOf();
+    assert.equal(items[0].workspaceId, null);
+    assert.equal(items[0].workspaceLabel, null);
+  });
+
+  test("coexists with notes: linking keeps the note, and editing or clearing the note keeps the link", async () => {
+    writeFileSync(FILE, "- [ ] alpha\n  first line\n  second line\n");
+    await link(0, "alpha", "wks_1", "my-ws");
+    assert.equal(
+      read(),
+      "- [ ] alpha\n  [my-ws](paseo:workspace:wks_1)\n  first line\n  second line\n",
+    );
+    let item = (await itemsOf())[0];
+    assert.equal(item.workspaceId, "wks_1");
+    assert.equal(item.workspaceLabel, "my-ws");
+    assert.equal(item.note, "first line\nsecond line");
+
+    await setNote(0, "alpha", "updated note");
+    assert.equal(read(), "- [ ] alpha\n  [my-ws](paseo:workspace:wks_1)\n  updated note\n");
+    item = (await itemsOf())[0];
+    assert.equal(item.workspaceId, "wks_1");
+    assert.equal(item.note, "updated note");
+
+    // Clearing the note leaves the workspace binding intact.
+    await setNote(0, "alpha", "");
+    assert.equal(read(), "- [ ] alpha\n  [my-ws](paseo:workspace:wks_1)\n");
+    item = (await itemsOf())[0];
+    assert.equal(item.workspaceId, "wks_1");
+    assert.equal(item.note, "");
+
+    // Adding a note back puts it under the workspace link, and unlinking keeps the note.
+    await setNote(0, "alpha", "kept note");
+    await link(0, "alpha", null);
+    assert.equal(read(), "- [ ] alpha\n  kept note\n");
+    item = (await itemsOf())[0];
+    assert.equal(item.workspaceId, null);
+    assert.equal(item.note, "kept note");
+  });
+
+  test("a note line shaped like a workspace link stays a note and never binds the task", async () => {
+    writeFileSync(FILE, "- [ ] alpha\n");
+    await setNote(0, "alpha", "[fake](paseo:workspace:wks_999)");
+    const item = (await itemsOf())[0];
+    assert.equal(item.workspaceId, null);
+    assert.equal(item.workspaceLabel, null);
+    assert.equal(item.note, "[fake](paseo:workspace:wks_999)");
+  });
+
+  test("list refreshes the workspace label from active workspaces and falls back when archived", async () => {
+    writeFileSync(FILE, "- [ ] alpha\n  [old-name](paseo:workspace:wks_1)\n");
+    workspaceEntries = [{ id: "wks_1", projectId: P, name: "renamed-ws" }];
+    let item = (await itemsOf())[0];
+    assert.equal(item.workspaceId, "wks_1");
+    assert.equal(item.workspaceLabel, "renamed-ws");
+
+    // A custom title wins over the generated name, like the client's `title || name`.
+    workspaceEntries = [{ id: "wks_1", projectId: P, name: "renamed-ws", title: "My board" }];
+    item = (await itemsOf())[0];
+    assert.equal(item.workspaceLabel, "My board");
+
+    // Once archived or gone from active entries, the stored Markdown label is used.
+    workspaceEntries = [];
+    item = (await itemsOf())[0];
+    assert.equal(item.workspaceId, "wks_1");
+    assert.equal(item.workspaceLabel, "old-name");
+  });
+
+  test("survives toggle, edit and move across files, and is removed with the task", async () => {
+    const ROOT2 = join(SANDBOX, "project2");
+    mkdirSync(ROOT2, { recursive: true });
+    projects.push({ projectId: "p2", projectRootPath: ROOT2, projectDisplayName: "P2" });
+    writeFileSync(FILE, "- [ ] alpha\n");
+    await link(0, "alpha", "wks_1", "worktree-a");
+    await toggle(0, "alpha");
+    await edit(0, "alpha", "alpha2");
+    await move(0, "alpha2", 0, P, "p2");
+    const list = await server.listTodosHandler({}, ctx);
+    const p2Item = list.projects.find((file) => file.projectId === "p2")!.items[0];
+    assert.equal(p2Item.text, "alpha2");
+    assert.equal(p2Item.done, true);
+    assert.equal(p2Item.workspaceId, "wks_1");
+    assert.equal(p2Item.workspaceLabel, "worktree-a");
+    rmSync(ROOT2, { recursive: true, force: true });
+  });
+
+  test("sanitizes brackets and line breaks in label, keeps CRLF, and ignores no-ops", async () => {
+    writeFileSync(FILE, "- [ ] alpha\r\n");
+    await link(0, "alpha", "wks_1", "[WIP]\r\nmy-branch");
+    assert.equal(read(), "- [ ] alpha\r\n  [WIP my-branch](paseo:workspace:wks_1)\r\n");
+    const before = statSync(FILE).ino;
+    await link(0, "alpha", "wks_1", "[WIP] my-branch");
+    assert.equal(statSync(FILE).ino, before);
+    await link(0, "alpha", null);
+    const afterUnlink = statSync(FILE).ino;
+    await link(0, "alpha", null);
+    assert.equal(statSync(FILE).ino, afterUnlink);
+    await assert.rejects(link(0, "nope", "wks_1", "x"), /changed on disk/);
+  });
+});
+

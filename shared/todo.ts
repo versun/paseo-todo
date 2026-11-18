@@ -7,6 +7,9 @@ const todoItemSchema = z.object({
   done: z.boolean(),
   /** Extra notes for the task; stored as indented lines under it. */
   note: z.string(),
+  /** Bound workspace id and display label, stored as a leading Markdown link in the note block. */
+  workspaceId: z.string().nullable(),
+  workspaceLabel: z.string().nullable(),
 });
 
 const todoFileSchema = z.object({
@@ -112,6 +115,23 @@ export const noteTodo = defineRpc({
     index: z.number().int().nonnegative(),
     text: z.string(),
     note: z.string(),
+  }),
+  output: z.object({ ok: z.boolean() }),
+});
+
+/**
+ * Binds or unbinds (`workspaceId: null`) a workspace on the task at `index`.
+ * Stored as `[label](paseo:workspace:<id>)` at the top of the task's note
+ * block. `text` is the same stale-index guard used by toggle/edit/note/remove.
+ */
+export const linkTodo = defineRpc({
+  name: "todo.link",
+  input: z.object({
+    projectId: z.string().nullable(),
+    index: z.number().int().nonnegative(),
+    text: z.string(),
+    workspaceId: z.string().trim().min(1).nullable(),
+    workspaceLabel: z.string().nullable().optional(),
   }),
   output: z.object({ ok: z.boolean() }),
 });
