@@ -8,7 +8,7 @@ See [OVERVIEW.md](OVERVIEW.md) for the full feature description.
 
 ## Features
 
-- TODO screen aggregating all lists (Global / per-project), with progress
+- TODO screen aggregating all lists (Inbox / per-project), with progress
 - Explorer TODO tab for the current workspace
 - Composer pill that appears when the workspace's project has open tasks:
   shows the count, lets you check them off, and opens the Explorer tab

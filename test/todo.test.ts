@@ -57,16 +57,28 @@ const ctx = {
 
 const P = "p1";
 
-// Pure client helper tested here so the screen's "no empty projects" rule
-// cannot regress. The server tests below keep exercising the RPC layer.
-const { visibleTodoFiles } = await import("../shared/todo");
+// Pure client helpers tested here so the screen's visibility, optimistic move,
+// and long-press drag gesture rules cannot regress. The server tests below
+// keep exercising the RPC layer.
+const {
+  computeDropTarget,
+  createLongPressDrag,
+  DRAG_HOLD_MS,
+  DRAG_SLOP_PX,
+  DRAG_SUPPRESS_PRESS_MS,
+  eventPoint,
+  moveInData,
+  pathFor,
+  visibleTodoFiles,
+} = await import("../shared/todo");
 type TodoFile = import("../shared/todo").TodoFile;
+type TodoListData = import("../shared/todo").TodoListData;
 
 const fileFor = (projectId: string | null, ...doneFlags: boolean[]): TodoFile => ({
   projectId,
   workspaceId: null,
-  label: projectId ?? "Global",
-  path: projectId === null ? join(HOME, "TODO.md") : join(ROOT, "TODO.md"),
+  label: projectId ?? "Inbox",
+  path: projectId === null ? join(HOME, "TODO.md") : join(ROOT, projectId, "TODO.md"),
   items: doneFlags.map((done, index) => ({
     index,
     text: `t${index}`,
@@ -78,9 +90,9 @@ const fileFor = (projectId: string | null, ...doneFlags: boolean[]): TodoFile =>
 });
 
 describe("visibleTodoFiles", () => {
-  test("projects without tasks are hidden; global and non-empty projects stay", () => {
+  test("projects without tasks are hidden; inbox and non-empty projects stay", () => {
     const files = visibleTodoFiles({
-      global: fileFor(null, false),
+      inbox: fileFor(null, false),
       projects: [fileFor(P, true), fileFor("p2"), fileFor("p3", false, true)],
       homeProjectIds: [],
     });
@@ -92,7 +104,7 @@ describe("visibleTodoFiles", () => {
 
   test("a project whose tasks are all completed still shows", () => {
     const files = visibleTodoFiles({
-      global: fileFor(null),
+      inbox: fileFor(null),
       projects: [fileFor(P, true, true)],
       homeProjectIds: [],
     });
@@ -104,7 +116,7 @@ describe("visibleTodoFiles", () => {
 
   test("a project whose file failed to read still shows so the error is visible", () => {
     const files = visibleTodoFiles({
-      global: fileFor(null),
+      inbox: fileFor(null),
       projects: [{ ...fileFor(P), error: "EISDIR" }],
       homeProjectIds: [],
     });
@@ -114,15 +126,265 @@ describe("visibleTodoFiles", () => {
     );
   });
 
-  test("global still shows when every list is empty", () => {
+  test("inbox still shows when every list is empty", () => {
     const files = visibleTodoFiles({
-      global: fileFor(null),
+      inbox: fileFor(null),
       projects: [fileFor(P), fileFor("p2")],
       homeProjectIds: [],
     });
     assert.deepEqual(
       files.map((file) => file.projectId),
       [null],
+    );
+  });
+});
+
+describe("long-press drag gesture", () => {
+  test("eventPoint extracts coordinates from pointer, responder, and DOM touch events", () => {
+    assert.deepEqual(eventPoint({ nativeEvent: { pageX: 12, pageY: 34 } }), { x: 12, y: 34 });
+    assert.deepEqual(
+      eventPoint({ nativeEvent: { touches: [{ pageX: 50, pageY: 60 }] } }),
+      { x: 50, y: 60 },
+    );
+    assert.deepEqual(
+      eventPoint({ nativeEvent: { touches: [], changedTouches: [{ pageX: 70, pageY: 80 }] } }),
+      { x: 70, y: 80 },
+    );
+    assert.equal(eventPoint({ nativeEvent: {} }), null);
+  });
+
+  test("holding past DRAG_HOLD_MS starts the drag, tracks moves, and commits on release", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const events: string[] = [];
+    const drag = createLongPressDrag({
+      onBegin: (key, x, y) => {
+        events.push(`begin:${key}:${x},${y}`);
+        return true;
+      },
+      onMove: (x, y) => events.push(`move:${x},${y}`),
+      onEnd: (commit) => events.push(`end:${commit}`),
+    });
+
+    // Duplicate start events from pointer + touch + responder capture arm only once.
+    drag.arm("inbox|open|0", 10, 20);
+    drag.arm("inbox|open|0", 99, 99);
+    assert.equal(drag.isDragging, false);
+
+    // Small drift within DRAG_SLOP_PX keeps the hold armed and updates the start point.
+    drag.move({ nativeEvent: { pageX: 10 + DRAG_SLOP_PX, pageY: 20 - DRAG_SLOP_PX } });
+    t.mock.timers.tick(DRAG_HOLD_MS);
+    assert.equal(drag.isDragging, true);
+    assert.deepEqual(events, [`begin:inbox|open|0:${10 + DRAG_SLOP_PX},${20 - DRAG_SLOP_PX}`]);
+
+    // Subsequent moves (including DOM TouchEvents) forward to onMove.
+    drag.move({ nativeEvent: { touches: [{ pageX: 30, pageY: 140 }] } });
+    assert.deepEqual(events, [
+      `begin:inbox|open|0:${10 + DRAG_SLOP_PX},${20 - DRAG_SLOP_PX}`,
+      "move:30,140",
+    ]);
+
+    drag.end(true);
+    assert.equal(drag.isDragging, false);
+    assert.deepEqual(events, [
+      `begin:inbox|open|0:${10 + DRAG_SLOP_PX},${20 - DRAG_SLOP_PX}`,
+      "move:30,140",
+      "end:true",
+    ]);
+    drag.dispose();
+  });
+
+  test("moving past DRAG_SLOP_PX before DRAG_HOLD_MS disarms so scrolling never starts a drag", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let began = false;
+    const drag = createLongPressDrag({
+      onBegin: () => {
+        began = true;
+        return true;
+      },
+      onMove: () => {},
+      onEnd: () => {},
+    });
+
+    drag.arm("inbox|open|0", 100, 100);
+    drag.move({ nativeEvent: { pageX: 100, pageY: 100 + DRAG_SLOP_PX + 1 } });
+    t.mock.timers.tick(DRAG_HOLD_MS * 2);
+    assert.equal(began, false);
+    assert.equal(drag.isDragging, false);
+    assert.equal(drag.shouldIgnorePress(), false);
+    drag.dispose();
+  });
+
+  test("short taps do not start a drag and shouldIgnorePress cancels any pending hold", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let began = false;
+    const drag = createLongPressDrag({
+      onBegin: () => {
+        began = true;
+        return true;
+      },
+      onMove: () => {},
+      onEnd: () => {},
+    });
+
+    // If a child Pressable fires onPress before pointerup (or unmounts on tap),
+    // shouldIgnorePress() returns false and cancels the pending hold timer.
+    drag.arm("inbox|open|0", 10, 20);
+    t.mock.timers.tick(DRAG_HOLD_MS - 50);
+    assert.equal(drag.shouldIgnorePress(), false);
+    t.mock.timers.tick(DRAG_HOLD_MS);
+    assert.equal(began, false);
+    assert.equal(drag.isDragging, false);
+    drag.dispose();
+  });
+
+  test("shouldIgnorePress stays true across release to block trailing clicks, then resets", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const drag = createLongPressDrag({
+      onBegin: () => true,
+      onMove: () => {},
+      onEnd: () => {},
+    });
+
+    drag.arm("inbox|open|0", 10, 20);
+    t.mock.timers.tick(DRAG_HOLD_MS);
+    // pointerup runs end(true) before the browser synthesizes click -> onPress.
+    drag.end(true);
+    assert.equal(drag.shouldIgnorePress(), true);
+
+    t.mock.timers.tick(DRAG_SUPPRESS_PRESS_MS);
+    assert.equal(drag.shouldIgnorePress(), false);
+
+    // Starting a new press before the suppression window elapses also resets it immediately.
+    drag.arm("inbox|open|0", 10, 20);
+    t.mock.timers.tick(DRAG_HOLD_MS);
+    drag.end(false);
+    assert.equal(drag.shouldIgnorePress(), true);
+    drag.arm("inbox|open|1", 10, 50);
+    assert.equal(drag.shouldIgnorePress(), false);
+    drag.dispose();
+  });
+
+  test("disarmZone cancels a pending hold for that zone but never aborts an active drag", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const events: string[] = [];
+    const drag = createLongPressDrag({
+      onBegin: (key) => {
+        events.push(`begin:${key}`);
+        return true;
+      },
+      onMove: (x, y) => events.push(`move:${x},${y}`),
+      onEnd: (commit) => events.push(`end:${commit}`),
+    });
+
+    // Unmounting before DRAG_HOLD_MS cancels that zone's pending hold.
+    drag.arm("inbox|open|0", 10, 20);
+    drag.disarmZone("inbox|open|1"); // different zone: ignored
+    drag.disarmZone("inbox|open|0"); // armed zone: disarmed
+    t.mock.timers.tick(DRAG_HOLD_MS);
+    assert.equal(drag.isDragging, false);
+    assert.deepEqual(events, []);
+
+    // Once dragging, a zone re-registering on re-render must not abort the drag.
+    drag.arm("inbox|open|0", 10, 20);
+    t.mock.timers.tick(DRAG_HOLD_MS);
+    assert.equal(drag.isDragging, true);
+    drag.disarmZone("inbox|open|0");
+    assert.equal(drag.isDragging, true);
+    drag.move({ nativeEvent: { pageX: 15, pageY: 80 } });
+    drag.end(true);
+    assert.deepEqual(events, ["begin:inbox|open|0", "move:15,80", "end:true"]);
+    drag.dispose();
+  });
+
+  test("computeDropTarget resolves row top/bottom halves and section end zones", () => {
+    const inbox = fileFor(null, false, false);
+    const rects = [
+      { kind: "end" as const, file: inbox, item: null, x: 0, y: 0, w: 300, h: 200 },
+      { kind: "row" as const, file: inbox, item: inbox.items[0], x: 10, y: 20, w: 280, h: 40 },
+      { kind: "row" as const, file: inbox, item: inbox.items[1], x: 10, y: 60, w: 280, h: 40 },
+    ];
+    // Top half of row 0 -> before index 0 (y = 20).
+    assert.deepEqual(computeDropTarget(rects, 30), {
+      file: inbox,
+      toIndex: 0,
+      x: 10,
+      y: 20,
+      w: 280,
+    });
+    // Bottom half of row 0 -> after index 0 (toIndex = 1, y = 60).
+    assert.deepEqual(computeDropTarget(rects, 45), {
+      file: inbox,
+      toIndex: 1,
+      x: 10,
+      y: 60,
+      w: 280,
+    });
+    // Inside the section outside any row -> append at end (toIndex = 2, y = 200).
+    assert.deepEqual(computeDropTarget(rects, 150), {
+      file: inbox,
+      toIndex: 2,
+      x: 0,
+      y: 200,
+      w: 300,
+    });
+    // Outside all zones -> null.
+    assert.equal(computeDropTarget(rects, 250), null);
+  });
+
+  test("moveInData and pathFor handle inbox, homeProjectIds, reorders, and cross-file moves", () => {
+    const data: TodoListData = {
+      inbox: fileFor(null, false, false),
+      projects: [fileFor(P, false, true)],
+      homeProjectIds: ["home-proj"],
+    };
+    assert.equal(pathFor(data, null), data.inbox.path);
+    assert.equal(pathFor(data, "home-proj"), data.inbox.path);
+    assert.equal(pathFor(data, P), data.projects[0].path);
+    assert.equal(pathFor(data, "unknown"), undefined);
+
+    // Dropping an item onto its own spot or right after itself keeps data identity.
+    assert.equal(
+      moveInData(data, { projectId: null, index: 0, toProjectId: null, toIndex: 0 }),
+      data,
+    );
+    assert.equal(
+      moveInData(data, { projectId: null, index: 0, toProjectId: null, toIndex: 1 }),
+      data,
+    );
+
+    // Reordering within inbox updates indices.
+    const reordered = moveInData(data, {
+      projectId: null,
+      index: 0,
+      toProjectId: "home-proj",
+      toIndex: 2,
+    })!;
+    assert.deepEqual(
+      reordered.inbox.items.map((item) => [item.index, item.text]),
+      [
+        [0, "t1"],
+        [1, "t0"],
+      ],
+    );
+
+    // Moving from project P into inbox updates both lists and reindexes.
+    const movedToInbox = moveInData(data, {
+      projectId: P,
+      index: 1,
+      toProjectId: null,
+      toIndex: 1,
+    })!;
+    assert.deepEqual(
+      movedToInbox.inbox.items.map((item) => [item.index, item.text, item.done]),
+      [
+        [0, "t0", false],
+        [1, "t1", true],
+        [2, "t1", false],
+      ],
+    );
+    assert.deepEqual(
+      movedToInbox.projects[0].items.map((item) => [item.index, item.text]),
+      [[0, "t0"]],
     );
   });
 });
@@ -535,14 +797,14 @@ describe("move between files", () => {
     assert.equal(read2(), "- [ ] a\n");
   });
 
-  test("appending to the global file works", async () => {
-    const globalFile = join(HOME, "TODO.md");
+  test("appending to the inbox file works", async () => {
+    const inboxFile = join(HOME, "TODO.md");
     writeFileSync(FILE, "- [ ] a\n- [ ] b\n");
-    rmSync(globalFile, { force: true });
+    rmSync(inboxFile, { force: true });
     await move(1, "b", 5, P, null);
     assert.equal(read(), "- [ ] a\n");
-    assert.equal(readFileSync(globalFile, "utf8"), "- [ ] b\n");
-    rmSync(globalFile, { force: true });
+    assert.equal(readFileSync(inboxFile, "utf8"), "- [ ] b\n");
+    rmSync(inboxFile, { force: true });
   });
 
   test("stale text writes neither file", async () => {
@@ -612,13 +874,13 @@ describe("list", () => {
     assert.equal(list.projects.length, 1);
     assert.deepEqual(list.projects[0].items, []);
     assert.match(list.projects[0].error ?? "", /EISDIR|directory/i);
-    assert.deepEqual(list.global.items, []);
-    assert.equal(list.global.error, undefined);
+    assert.deepEqual(list.inbox.items, []);
+    assert.equal(list.inbox.error, undefined);
   });
 });
 
 describe("path resolution", () => {
-  test("global add writes to ~/TODO.md", async () => {
+  test("inbox add writes to ~/TODO.md", async () => {
     rmSync(join(HOME, "TODO.md"), { force: true });
     assert.equal(existsSync(join(HOME, "TODO.md")), false);
     await add("g", null);
@@ -626,32 +888,32 @@ describe("path resolution", () => {
   });
 
   test("a project rooted at ~ uses ~/TODO.md; ~/.paseo and empty roots are rejected", async () => {
-    const globalFile = join(HOME, "TODO.md");
-    rmSync(globalFile, { force: true });
+    const inboxFile = join(HOME, "TODO.md");
+    rmSync(inboxFile, { force: true });
     projects = [
       { projectId: "home", projectRootPath: `${HOME}/`, projectDisplayName: "Home" },
       { projectId: "paseo", projectRootPath: join(HOME, ".paseo"), projectDisplayName: "Paseo" },
       { projectId: "empty", projectRootPath: "", projectDisplayName: "Empty" },
     ];
     await add("h", "home");
-    assert.equal(readFileSync(globalFile, "utf8"), "- [ ] h\n");
+    assert.equal(readFileSync(inboxFile, "utf8"), "- [ ] h\n");
     await assert.rejects(add("x", "paseo"), /Project not found/);
     await assert.rejects(add("x", "empty"), /Project not found/);
     await assert.rejects(add("x", "missing"), /Project not found/);
     const list = await server.listTodosHandler({}, ctx);
     assert.equal(list.projects.length, 0);
-    assert.deepEqual(list.global.items.map((item) => item.text), ["h"]);
+    assert.deepEqual(list.inbox.items.map((item) => item.text), ["h"]);
   });
 
   test("a project rooted at a symlink to ~ uses ~/TODO.md and reports homeProjectIds", async () => {
-    const globalFile = join(HOME, "TODO.md");
-    rmSync(globalFile, { force: true });
+    const inboxFile = join(HOME, "TODO.md");
+    rmSync(inboxFile, { force: true });
     const link = join(SANDBOX, "home-link");
     rmSync(link, { force: true });
     symlinkSync(HOME, link);
     projects = [{ projectId: "h", projectRootPath: link, projectDisplayName: "Home" }];
     await add("via link", "h");
-    assert.equal(readFileSync(globalFile, "utf8"), "- [ ] via link\n");
+    assert.equal(readFileSync(inboxFile, "utf8"), "- [ ] via link\n");
     const list = await server.listTodosHandler({}, ctx);
     assert.deepEqual(list.projects, []);
     assert.deepEqual(list.homeProjectIds, ["h"]);

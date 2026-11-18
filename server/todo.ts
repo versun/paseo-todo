@@ -23,7 +23,7 @@ type PaseoApi = PluginHandlerContext["paseo"];
 type Project = Awaited<ReturnType<PaseoApi["projects"]["list"]>>["projects"][number];
 
 const HOME_DIR = resolve(homedir());
-const GLOBAL_FILE = join(HOME_DIR, "TODO.md");
+const INBOX_FILE = join(HOME_DIR, "TODO.md");
 const PASEO_HOME = join(HOME_DIR, ".paseo");
 const CHECKBOX = /^(\s*[-*+]\s+\[)([ xX])(\]\s+)(.*?)$/;
 const WORKSPACE_LINK = /^\[([^\]]*)\]\(paseo:workspace:([^\s)]+)\)$/;
@@ -254,7 +254,7 @@ function projectLabel(project: Project): string {
 }
 
 async function resolvePath(paseo: PaseoApi, projectId: string | null): Promise<string> {
-  if (!projectId) return GLOBAL_FILE;
+  if (!projectId) return INBOX_FILE;
   // Bounded so a hung daemon call cannot stall the mutation queue forever.
   const { projects } = await withTimeout(
     paseo.projects.list(),
@@ -266,8 +266,8 @@ async function resolvePath(paseo: PaseoApi, projectId: string | null): Promise<s
     ? await canonicalDir(project.projectRootPath)
     : "";
   const { home, paseo: paseoHome } = await canonicalHomeDirs();
-  // A workspace rooted at `~` (or a symlink to it) uses the global list.
-  if (canonical === home) return GLOBAL_FILE;
+  // A workspace rooted at `~` (or a symlink to it) uses the inbox list.
+  if (canonical === home) return INBOX_FILE;
   // `~/.paseo` is Paseo's own home; neither it nor an unknown root is a project.
   if (!project || canonical === "" || canonical === paseoHome) {
     throw new Error("Project not found");
@@ -374,8 +374,8 @@ export async function listTodosHandler(
       return aActive - bActive || projectLabel(a).localeCompare(projectLabel(b));
     });
 
-  const [globalLoad, projectFiles] = await Promise.all([
-    loadItems(GLOBAL_FILE),
+  const [inboxLoad, projectFiles] = await Promise.all([
+    loadItems(INBOX_FILE),
     Promise.all(
       validProjects.map(async (project) => {
         const path = join(project.projectRootPath, "TODO.md");
@@ -393,13 +393,13 @@ export async function listTodosHandler(
   ]);
 
   return {
-    global: {
+    inbox: {
       projectId: null,
       workspaceId: null,
-      label: "Global",
-      path: GLOBAL_FILE,
-      items: globalLoad.items,
-      error: globalLoad.error,
+      label: "Inbox",
+      path: INBOX_FILE,
+      items: inboxLoad.items,
+      error: inboxLoad.error,
     },
     projects: projectFiles,
     homeProjectIds,

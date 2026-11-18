@@ -41,17 +41,25 @@ import {
 } from "react-native";
 import {
   addTodo,
+  computeDropTarget,
+  createLongPressDrag,
   editTodo,
+  eventPoint,
   linkTodo,
   listTodos,
   messageOf,
+  moveInData,
   moveTodo,
   normalizeNoteText,
   normalizeTaskText,
   noteTodo,
   removeTodo,
   toggleTodo,
+  updateFile,
   visibleTodoFiles,
+  type ActiveDrop,
+  type DragPointEvent,
+  type DragZoneRect,
   type TodoFile,
   type TodoItem,
   type TodoListData,
@@ -61,11 +69,12 @@ const LIST_KEY = ["todo", "list"];
 const MUTATION_KEY = ["todo", "mutation"];
 const POLL_MS = 2000;
 const COLLAPSE_DELAY_MS = 150;
-const GLOBAL_TARGET = { projectId: null, label: "Global" };
+const INBOX_TARGET = { projectId: null, label: "Inbox" };
+const PANEL_GUTTER = 12;
 
 type TodoTheme = PluginScreenProps["theme"];
 type TodoTarget = Pick<TodoFile, "projectId" | "label">;
-type FilterMode = "all" | "global" | "projects";
+type FilterMode = "all" | "inbox" | "projects";
 type WorkspaceRef = { projectId: string; projectRootPath: string };
 type WorkspaceBinding = { id: string; label: string };
 
@@ -232,91 +241,6 @@ function useBoundWorkspaceStatus(id: string | null): BoundWorkspaceStatus {
 
 function openCount(files: TodoFile[]) {
   return files.reduce((sum, file) => sum + file.items.filter((item) => !item.done).length, 0);
-}
-
-/** The file a projectId writes to: the global file for `null` and `~` roots. */
-function pathFor(data: TodoListData, projectId: string | null): string | undefined {
-  return projectId === null
-    ? data.global.path
-    : (data.projects.find((file) => file.projectId === projectId)?.path ??
-        // Projects rooted at `~` (even via symlink) are not listed; their file
-        // is the global one.
-        (data.homeProjectIds.includes(projectId) ? data.global.path : undefined));
-}
-
-/** Returns `data` itself when no file changed, so no-ops keep query identity. */
-function mapFiles(
-  data: TodoListData,
-  apply: (file: TodoFile) => TodoFile,
-): TodoListData {
-  const global = apply(data.global);
-  const projects = data.projects.map(apply);
-  if (global === data.global && projects.every((file, i) => file === data.projects[i])) {
-    return data;
-  }
-  return { ...data, global, projects };
-}
-
-/** Apply an optimistic edit to the target file, and to any project sharing its path. */
-function updateFile(
-  data: TodoListData | undefined,
-  projectId: string | null,
-  updater: (items: TodoItem[]) => TodoItem[],
-): TodoListData | undefined {
-  if (!data) return data;
-  const path = pathFor(data, projectId);
-  if (!path) return data;
-  return mapFiles(data, (file) => {
-    if (file.path !== path) return file;
-    const items = updater(file.items);
-    if (items === file.items) return file;
-    return { ...file, items: items.map((item, index) => ({ ...item, index })) };
-  });
-}
-
-/**
- * Optimistic counterpart of `todo.move`: relocate the item between two files
- * (or reorder inside one), mirroring the server's index adjustment and
- * clamping. No-ops and missing items leave the data untouched.
- */
-function moveInData(
-  data: TodoListData | undefined,
-  input: { projectId: string | null; index: number; toProjectId: string | null; toIndex: number },
-): TodoListData | undefined {
-  if (!data) return data;
-  const fromPath = pathFor(data, input.projectId);
-  const toPath = pathFor(data, input.toProjectId);
-  if (!fromPath || !toPath) return data;
-  if (fromPath === toPath) {
-    return updateFile(data, input.projectId, (items) => {
-      const item = items.find((entry) => entry.index === input.index);
-      if (!item) return items;
-      const at = input.toIndex > input.index ? input.toIndex - 1 : input.toIndex;
-      if (at === input.index) return items;
-      const rest = items.filter((entry) => entry.index !== input.index);
-      rest.splice(Math.min(Math.max(at, 0), rest.length), 0, item);
-      return rest;
-    });
-  }
-  const source = [data.global, ...data.projects].find((file) => file.path === fromPath);
-  const moved = source?.items.find((item) => item.index === input.index);
-  if (!moved) return data;
-  return mapFiles(data, (file) => {
-    if (file.path === fromPath) {
-      return {
-        ...file,
-        items: file.items
-          .filter((item) => item.index !== input.index)
-          .map((item, index) => ({ ...item, index })),
-      };
-    }
-    if (file.path === toPath) {
-      const items = [...file.items];
-      items.splice(Math.min(Math.max(input.toIndex, 0), items.length), 0, moved);
-      return { ...file, items: items.map((item, index) => ({ ...item, index })) };
-    }
-    return file;
-  });
 }
 
 /**
@@ -526,19 +450,15 @@ type DragZone = {
   view: View;
 };
 
-type ZoneRect = DragZone & { key: string; x: number; y: number; w: number; h: number };
+type ZoneRect = DragZone & DragZoneRect & { key: string };
 
 type ActiveDrag = { key: string; file: TodoFile; item: TodoItem; group: DragGroup };
-
-/** `x`/`y`/`w` locate the indicator line in window coordinates. */
-type ActiveDrop = { file: TodoFile; toIndex: number; x: number; y: number; w: number };
 
 type TodoDragContextValue = {
   dragging: ActiveDrag | null;
   register(key: string, get: () => DragZone | null): () => void;
-  beginDrag(key: string, pageX: number, pageY: number): void;
-  moveDrag(pageX: number, pageY: number): void;
-  endDrag(commit: boolean): void;
+  armDrag(key: string, pageX: number, pageY: number): void;
+  shouldIgnorePress(): boolean;
 };
 
 const TodoDragContext = createContext<TodoDragContextValue | null>(null);
@@ -554,11 +474,12 @@ function measureWindow(view: View): Promise<{ x: number; y: number; w: number; h
 }
 
 /**
- * Drag-and-drop for the todo rows of one surface. Row grips own the responder
- * (and refuse termination, so the ScrollView cannot steal the gesture); zones
- * are measured once per drag and re-measured whenever the registry changes
- * (e.g. a poll landing mid-drag). Drops report a source item plus the
- * destination file and `toIndex` understood by `todo.move`.
+ * Drag-and-drop for the todo rows of one surface. Rows arm on a long press,
+ * after which the surface container owns the responder (above the ScrollView,
+ * refusing termination so scrolling cannot steal the gesture); zones are
+ * measured once per drag and re-measured whenever the registry changes (e.g. a
+ * poll landing mid-drag). Drops report a source item plus the destination file
+ * and `toIndex` understood by `todo.move`.
  */
 function TodoDragProvider({
   theme,
@@ -600,39 +521,17 @@ function TodoDragProvider({
         return rect ? { key, ...zone, ...rect } : null;
       }),
     );
+    if (!dragRef.current) return;
     zoneRects.current = rects.filter((rect): rect is ZoneRect => rect !== null);
     measuredVersion.current = zonesVersion.current;
   }, []);
 
-  const computeDrop = useCallback((pageY: number): ActiveDrop | null => {
-    for (const rect of zoneRects.current) {
-      if (rect.kind !== "row" || !rect.item) continue;
-      if (pageY >= rect.y && pageY <= rect.y + rect.h) {
-        const after = pageY > rect.y + rect.h / 2;
-        return {
-          file: rect.file,
-          toIndex: after ? rect.item.index + 1 : rect.item.index,
-          x: rect.x,
-          y: after ? rect.y + rect.h : rect.y,
-          w: rect.w,
-        };
-      }
-    }
-    for (const rect of zoneRects.current) {
-      if (rect.kind !== "end") continue;
-      if (pageY >= rect.y && pageY <= rect.y + rect.h) {
-        return { file: rect.file, toIndex: rect.file.items.length, x: rect.x, y: rect.y + rect.h, w: rect.w };
-      }
-    }
-    return null;
-  }, []);
-
   const updateFromPointer = useCallback(() => {
     if (!dragRef.current) return;
-    const { y } = pointer.current;
-    pointerY.setValue(y - containerXYRef.current.y);
+    pointerY.setValue(pointer.current.y - containerXYRef.current.y);
     const apply = () => {
-      const next = computeDrop(y);
+      if (!dragRef.current) return;
+      const next = computeDropTarget(zoneRects.current, pointer.current.y);
       const prev = dropRef.current;
       if (next?.file.path !== prev?.file.path || next?.toIndex !== prev?.toIndex || next?.y !== prev?.y) {
         dropRef.current = next;
@@ -644,88 +543,115 @@ function TodoDragProvider({
       return;
     }
     apply();
-  }, [computeDrop, pointerY, refreshRects]);
+  }, [pointerY, refreshRects]);
 
-  const beginDrag = useCallback(
-    (key: string, pageX: number, pageY: number) => {
-      if (dragRef.current) return;
-      const zone = zones.current.get(key)?.();
-      if (!zone || zone.kind !== "row" || !zone.item) return;
-      const active: ActiveDrag = { key, file: zone.file, item: zone.item, group: zone.group };
-      dragRef.current = active;
-      pointer.current = { x: pageX, y: pageY };
-      zonesVersion.current += 1;
-      setDrag(active);
-      const container = containerRef.current;
-      if (container) {
-        container.measureInWindow((cx, cy) => {
-          containerXYRef.current = { x: cx, y: cy };
-          setContainerXY({ x: cx, y: cy });
-          pointerY.setValue(pointer.current.y - cy);
-          void measureWindow(zone.view).then((rect) => {
-            if (rect && dragRef.current?.key === key) {
-              setGhostFrame({ x: rect.x - cx, w: rect.w });
-            }
-          });
-        });
-      }
-      // Compute the drop once the fresh rects land so a quick drag still lands.
-      void refreshRects(zone.group).then(updateFromPointer);
-    },
+  const gesture = useMemo(
+    () =>
+      createLongPressDrag({
+        onBegin: (key, pageX, pageY) => {
+          const zone = zones.current.get(key)?.();
+          if (!zone || zone.kind !== "row" || !zone.item) return false;
+          const active: ActiveDrag = { key, file: zone.file, item: zone.item, group: zone.group };
+          dragRef.current = active;
+          pointer.current = { x: pageX, y: pageY };
+          zonesVersion.current += 1;
+          setDrag(active);
+          const container = containerRef.current;
+          if (container) {
+            container.measureInWindow((cx, cy) => {
+              if (dragRef.current?.key !== key) return;
+              containerXYRef.current = { x: cx, y: cy };
+              setContainerXY({ x: cx, y: cy });
+              pointerY.setValue(pointer.current.y - cy);
+              void measureWindow(zone.view).then((rect) => {
+                if (rect && dragRef.current?.key === key) {
+                  setGhostFrame({ x: rect.x - cx, w: rect.w });
+                }
+              });
+            });
+          }
+          // Compute the drop once the fresh rects land so a quick drag still lands.
+          void refreshRects(zone.group).then(updateFromPointer);
+          return true;
+        },
+        onMove: (pageX, pageY) => {
+          pointer.current = { x: pageX, y: pageY };
+          updateFromPointer();
+        },
+        onEnd: (commit) => {
+          const active = dragRef.current;
+          const target = dropRef.current;
+          dragRef.current = null;
+          dropRef.current = null;
+          zoneRects.current = [];
+          measuredVersion.current = -1;
+          if (!active) return;
+          setDrag(null);
+          setDrop(null);
+          setGhostFrame(null);
+          if (!commit || !target) return;
+          if (target.file.path === active.file.path) {
+            const landing =
+              target.toIndex > active.item.index ? target.toIndex - 1 : target.toIndex;
+            if (landing === active.item.index) return; // Dropped where it already sits.
+          }
+          onDropRef.current(
+            { file: active.file, item: active.item },
+            { file: target.file, toIndex: target.toIndex },
+          );
+        },
+      }),
     [pointerY, refreshRects, updateFromPointer],
   );
 
-  const moveDrag = useCallback(
-    (pageX: number, pageY: number) => {
-      if (!dragRef.current) return;
-      pointer.current = { x: pageX, y: pageY };
-      updateFromPointer();
-    },
-    [updateFromPointer],
-  );
+  useEffect(() => () => gesture.dispose(), [gesture]);
 
-  const endDrag = useCallback((commit: boolean) => {
-    const active = dragRef.current;
-    const target = dropRef.current;
-    dragRef.current = null;
-    dropRef.current = null;
-    zoneRects.current = [];
-    measuredVersion.current = -1;
-    setDrag(null);
-    setDrop(null);
-    setGhostFrame(null);
-    if (!commit || !active || !target) return;
-    if (target.file.path === active.file.path) {
-      const landing = target.toIndex > active.item.index ? target.toIndex - 1 : target.toIndex;
-      if (landing === active.item.index) return; // Dropped where it already sits.
-    }
-    onDropRef.current(
-      { file: active.file, item: active.item },
-      { file: target.file, toIndex: target.toIndex },
-    );
-  }, []);
+  const register = useCallback(
+    (key: string, get: () => DragZone | null) => {
+      zones.current.set(key, get);
+      zonesVersion.current += 1;
+      return () => {
+        zones.current.delete(key);
+        zonesVersion.current += 1;
+        gesture.disarmZone(key);
+      };
+    },
+    [gesture],
+  );
 
   const value = useMemo<TodoDragContextValue>(
     () => ({
       dragging: drag,
-      register: (key, get) => {
-        zones.current.set(key, get);
-        zonesVersion.current += 1;
-        return () => {
-          zones.current.delete(key);
-          zonesVersion.current += 1;
-        };
-      },
-      beginDrag,
-      moveDrag,
-      endDrag,
+      register,
+      armDrag: gesture.arm,
+      shouldIgnorePress: gesture.shouldIgnorePress,
     }),
-    [drag, beginDrag, moveDrag, endDrag],
+    [drag, register, gesture],
   );
 
   return (
     <TodoDragContext.Provider value={value}>
-      <View ref={containerRef} collapsable={false} style={styles.fill}>
+      <View
+        ref={containerRef}
+        collapsable={false}
+        style={styles.fill}
+        onMoveShouldSetResponderCapture={(event) => {
+          if (gesture.isDragging) return true;
+          gesture.move(event);
+          return false;
+        }}
+        onMoveShouldSetResponder={() => gesture.isDragging}
+        onResponderMove={gesture.move}
+        onResponderRelease={() => gesture.end(true)}
+        onResponderTerminate={() => gesture.end(false)}
+        onResponderTerminationRequest={() => false}
+        onPointerMove={gesture.move}
+        onPointerUp={() => gesture.end(true)}
+        onPointerCancel={() => gesture.end(false)}
+        onTouchMove={gesture.move}
+        onTouchEnd={() => gesture.end(true)}
+        onTouchCancel={() => gesture.end(false)}
+      >
         {children}
         {drag ? (
           <View pointerEvents="none" style={StyleSheet.absoluteFill}>
@@ -750,13 +676,14 @@ function TodoDragProvider({
                     left: ghostFrame.x,
                     width: ghostFrame.w,
                     backgroundColor: theme.colors.surface1,
-                    borderColor: theme.colors.accent,
+                    borderColor: theme.colors.border,
+                    borderLeftColor: theme.colors.accent,
                     transform: [{ translateY: Animated.subtract(pointerY, 18) }],
                   },
                 ]}
               >
-                <Icon name="GripVertical" size={13} color={theme.colors.foregroundMuted} />
                 <Text
+                  selectable={false}
                   numberOfLines={1}
                   style={[
                     styles.dragGhostText,
@@ -779,7 +706,7 @@ function TodoDragProvider({
 
 export function TodoSidebarItem({ theme, currentScreen, openScreen }: PluginSidebarItemProps) {
   const { data } = useTodoList();
-  const count = data ? openCount([data.global, ...data.projects]) : 0;
+  const count = data ? openCount([data.inbox, ...data.projects]) : 0;
 
   return (
     <SidebarRow
@@ -865,8 +792,9 @@ function TodoRow({
   const noteInputRef = useRef<NativeTextInput>(null);
   const expandAnim = useRef(new Animated.Value(0)).current;
   const drag = useContext(TodoDragContext);
+  const registerZone = drag?.register;
   const rowRef = useRef<View>(null);
-  const zoneKey = `${file.projectId ?? "global"}|${group}|${item.index}`;
+  const zoneKey = `${file.projectId ?? "inbox"}|${group}|${item.index}`;
   const zoneData = useLatest({ file, group, item });
   const lifted = drag?.dragging?.key === zoneKey;
   const expandedRef = useLatest(expanded);
@@ -886,15 +814,15 @@ function TodoRow({
   );
 
   useLayoutEffect(() => {
-    if (!drag) return;
-    return drag.register(zoneKey, () => {
+    if (!registerZone) return;
+    return registerZone(zoneKey, () => {
       const view = rowRef.current;
       const { file: zoneFile, group: zoneGroup, item: zoneItem } = zoneData.current;
       return view
         ? { kind: "row", group: zoneGroup, file: zoneFile, item: zoneItem, view }
         : null;
     });
-  }, [drag, zoneKey]);
+  }, [registerZone, zoneKey]);
 
   // Props that differ from what this row last saw come from a poll, or from
   // this row's own optimistic commit echoing back. While a draft is dirty we
@@ -924,6 +852,10 @@ function TodoRow({
     },
     [],
   );
+
+  useEffect(() => {
+    if (lifted && expandedRef.current) collapsePanel();
+  }, [lifted]);
 
   useEffect(() => {
     const animation = Animated.timing(expandAnim, {
@@ -963,6 +895,7 @@ function TodoRow({
 
   // Title taps edit only the title: they never open the details panel.
   const beginTitleEdit = () => {
+    if (drag?.shouldIgnorePress()) return;
     committed.current = false;
     setDraft(currentText.current);
     setEditingTitle(true);
@@ -1006,6 +939,7 @@ function TodoRow({
   };
 
   const toggleExpanded = () => {
+    if (drag?.shouldIgnorePress()) return;
     if (expanded) {
       collapsePanel();
     } else {
@@ -1024,6 +958,12 @@ function TodoRow({
     }
   };
 
+  const armRowDrag = (event: DragPointEvent) => {
+    if (!drag || editingTitle) return;
+    const point = eventPoint(event);
+    if (point) drag.armDrag(zoneKey, point.x, point.y);
+  };
+
   return (
     <View
       ref={rowRef}
@@ -1034,34 +974,27 @@ function TodoRow({
         lifted && styles.dragLifted,
       ]}
     >
-      <View style={styles.row}>
-        {drag ? (
-          <View
-            accessibilityRole="button"
-            accessibilityLabel={`Drag to reorder ${item.text}`}
-            hitSlop={6}
-            onStartShouldSetResponder={() => true}
-            onMoveShouldSetResponder={() => true}
-            onResponderGrant={(event) =>
-              drag.beginDrag(zoneKey, event.nativeEvent.pageX, event.nativeEvent.pageY)
-            }
-            onResponderMove={(event) =>
-              drag.moveDrag(event.nativeEvent.pageX, event.nativeEvent.pageY)
-            }
-            onResponderRelease={() => drag.endDrag(true)}
-            onResponderTerminate={() => drag.endDrag(false)}
-            onResponderTerminationRequest={() => false}
-            style={styles.dragHandle}
-          >
-            <Icon name="GripVertical" size={13} color={theme.colors.foregroundMuted} />
-          </View>
-        ) : null}
+      <View
+        style={styles.row}
+        // Arming hangs off several input paths because hosts differ: pointer
+        // events cover mouse and Fabric touch, touch events cover legacy
+        // touch, and the responder-capture hook covers hosts that dispatch
+        // neither. None of them claim the gesture, so taps still reach the
+        // controls inside.
+        onStartShouldSetResponderCapture={(event) => {
+          armRowDrag(event);
+          return false;
+        }}
+        onPointerDown={armRowDrag}
+        onTouchStart={armRowDrag}
+      >
         <Pressable
           accessibilityRole="checkbox"
           accessibilityState={{ checked: item.done }}
           accessibilityLabel={`${item.done ? "Uncheck" : "Check off"} ${item.text}`}
           hitSlop={8}
           onPress={() => {
+            if (drag?.shouldIgnorePress()) return;
             const text = expanded || editingTitle ? commit() : currentText.current;
             if (editingTitle) {
               setEditingTitle(false);
@@ -1126,6 +1059,7 @@ function TodoRow({
                 style={styles.rowTitlePress}
               >
                 <Text
+                  selectable={false}
                   style={[
                     styles.titleText,
                     {
@@ -1142,11 +1076,15 @@ function TodoRow({
                   accessibilityRole="button"
                   accessibilityLabel={`Show details of ${item.text}`}
                   onPress={() => {
+                    if (drag?.shouldIgnorePress()) return;
                     if (!expanded) toggleExpanded();
                   }}
                   style={styles.rowTitlePress}
                 >
-                  <Text style={[styles.itemNote, { color: theme.colors.foregroundMuted }]}>
+                  <Text
+                    selectable={false}
+                    style={[styles.itemNote, { color: theme.colors.foregroundMuted }]}
+                  >
                     {item.note}
                   </Text>
                 </Pressable>
@@ -1157,11 +1095,14 @@ function TodoRow({
                     accessibilityRole="button"
                     accessibilityLabel={`Open workspace ${boundWorkspaceLabel}`}
                     hitSlop={4}
-                    onPress={() => onOpenWorkspace!(boundWorkspaceId)}
+                    onPress={() => {
+                      if (!drag?.shouldIgnorePress()) onOpenWorkspace!(boundWorkspaceId);
+                    }}
                     style={styles.itemWorkspaceLink}
                   >
                     <Icon name="Link2" size={11} color={theme.colors.accent} />
                     <Text
+                      selectable={false}
                       numberOfLines={1}
                       style={[styles.itemWorkspaceText, { color: theme.colors.accent }]}
                     >
@@ -1184,6 +1125,7 @@ function TodoRow({
                       color={theme.colors.foregroundMuted}
                     />
                     <Text
+                      selectable={false}
                       numberOfLines={1}
                       style={[
                         styles.itemWorkspaceText,
@@ -1192,16 +1134,6 @@ function TodoRow({
                     >
                       {boundWorkspaceLabel}
                     </Text>
-                    {boundWorkspaceArchived ? (
-                      <Text
-                        style={[
-                          styles.itemWorkspaceText,
-                          { color: theme.colors.foregroundMuted },
-                        ]}
-                      >
-                        archived
-                      </Text>
-                    ) : null}
                   </View>
                 )
               ) : null}
@@ -1237,10 +1169,7 @@ function TodoRow({
         ]}
       >
         <View
-          // paddingLeft aligns the note under the title text: 63 when the
-          // drag handle renders (TodoDragContext present), 40 without it
-          // (e.g. WorkspaceTodoPillPopover renders rows with no provider).
-          style={[styles.rowPanel, { paddingLeft: drag ? 63 : 40 }]}
+          style={styles.rowPanel}
           onTouchStart={cancelCollapse}
           onTouchEnd={() => {
             // A touch inside the panel that left nothing focused (e.g. blank
@@ -1289,10 +1218,7 @@ function TodoRow({
               },
             ]}
           />
-          <View
-            pointerEvents="box-none"
-            style={[styles.noteActions, { left: (drag ? 63 : 40) + 6 }]}
-          >
+          <View pointerEvents="box-none" style={styles.noteActions}>
             {boundWorkspaceId && boundWorkspaceLabel ? (
               canOpenBoundWorkspace ? (
                 <View style={styles.noteLinkGroup}>
@@ -1378,11 +1304,6 @@ function TodoRow({
                   >
                     {boundWorkspaceLabel}
                   </Text>
-                  {boundWorkspaceArchived ? (
-                    <Text style={[styles.rowActionText, { color: theme.colors.foregroundMuted }]}>
-                      archived
-                    </Text>
-                  ) : null}
                   <Icon name="X" size={11} color={theme.colors.foregroundMuted} />
                 </Pressable>
               )
@@ -1493,28 +1414,29 @@ function TodoSection({
   const openItems = file.items.filter((item) => !item.done);
   const doneItems = file.items.filter((item) => item.done);
   const total = file.items.length;
-  const isGlobal = file.projectId === null;
+  const isInbox = file.projectId === null;
   const drag = useContext(TodoDragContext);
+  const registerZone = drag?.register;
   // The whole section (header + card) is the "append at end" zone for both
   // groups; row zones take priority for precise positions. This also lets a
   // done item drop into a file that has no completed items yet.
   const sectionRef = useRef<View>(null);
   const zoneFile = useLatest(file);
-  const baseKey = `${file.projectId ?? "global"}|${file.path}`;
+  const baseKey = `${file.projectId ?? "inbox"}|${file.path}`;
 
   useLayoutEffect(() => {
-    if (!drag) return;
+    if (!registerZone) return;
     const endZone = (group: DragGroup) => () =>
       sectionRef.current
         ? { kind: "end" as const, group, file: zoneFile.current, item: null, view: sectionRef.current }
         : null;
-    const offOpen = drag.register(`${baseKey}|end|open`, endZone("open"));
-    const offDone = drag.register(`${baseKey}|end|done`, endZone("done"));
+    const offOpen = registerZone(`${baseKey}|end|open`, endZone("open"));
+    const offDone = registerZone(`${baseKey}|end|done`, endZone("done"));
     return () => {
       offOpen();
       offDone();
     };
-  }, [drag, baseKey]);
+  }, [registerZone, baseKey]);
 
   return (
     <View ref={sectionRef} collapsable={false} style={styles.section}>
@@ -1537,13 +1459,13 @@ function TodoSection({
           <View
             style={[
               styles.sectionIcon,
-              { backgroundColor: isGlobal ? theme.colors.accent : theme.colors.surface2 },
+              { backgroundColor: isInbox ? theme.colors.accent : theme.colors.surface2 },
             ]}
           >
             <Icon
-              name={isGlobal ? "Inbox" : "FolderGit2"}
+              name={isInbox ? "Inbox" : "FolderGit2"}
               size={14}
-              color={isGlobal ? theme.colors.accentForeground : theme.colors.foreground}
+              color={isInbox ? theme.colors.accentForeground : theme.colors.foreground}
             />
           </View>
           <View style={styles.sectionTitleBlock}>
@@ -1555,7 +1477,7 @@ function TodoSection({
               numberOfLines={1}
               ellipsizeMode="middle"
             >
-              {isGlobal ? "~/TODO.md" : file.path}
+              {isInbox ? "~/TODO.md" : file.path}
             </Text>
           </View>
           {openItems.length > 0 ? (
@@ -1584,7 +1506,7 @@ function TodoSection({
       {file.error ? (
         <EmptyCard theme={theme} text={file.error} danger />
       ) : total === 0 ? (
-        <EmptyCard theme={theme} text="No tasks yet — add one below." />
+        <EmptyCard theme={theme} text="No tasks yet — add one above." />
       ) : (
         <View
           style={[
@@ -1680,9 +1602,10 @@ function EmptyCard({
 }
 
 /** The single add field. Shows the target picker only when `targets` is given. */
-function TodoBottomComposer({
+function TodoComposer({
   theme,
   compact,
+  gutter,
   target,
   targets,
   onSelectTarget,
@@ -1691,6 +1614,8 @@ function TodoBottomComposer({
 }: {
   theme: TodoTheme;
   compact: boolean;
+  /** Horizontal inset matching the list content below, so the box edges align. */
+  gutter: number;
   target: TodoTarget;
   targets?: TodoTarget[];
   onSelectTarget?: (projectId: string | null) => void;
@@ -1713,16 +1638,15 @@ function TodoBottomComposer({
   return (
     <View
       style={[
-        styles.bottomDock,
+        styles.composerDock,
         {
           backgroundColor: theme.colors.surface0,
-          borderTopColor: theme.colors.border,
-          paddingHorizontal: compact ? 12 : 24,
+          borderBottomColor: theme.colors.border,
           paddingVertical: compact ? 10 : 14,
         },
       ]}
     >
-      <View style={styles.bottomDockInner}>
+      <View style={[styles.composerDockInner, { paddingHorizontal: gutter }]}>
         {targets && onSelectTarget ? (
           <ScrollView
             horizontal
@@ -1735,7 +1659,7 @@ function TodoBottomComposer({
               const foreground = selected ? theme.colors.accentForeground : theme.colors.foreground;
               return (
                 <Pressable
-                  key={item.projectId ?? "global"}
+                  key={item.projectId ?? "inbox"}
                   accessibilityRole="button"
                   accessibilityState={{ selected }}
                   accessibilityLabel={`Target ${item.label}`}
@@ -1816,7 +1740,7 @@ function TodoBottomComposer({
 }
 
 /**
- * Shifts the bottom composer above the software keyboard on mobile.
+ * Shifts the surface above the software keyboard on mobile.
  * `KeyboardAvoidingView` compares its local `layout.y` (0 inside Paseo's body
  * container) against `keyboardFrame.screenY`, so we measure the container's
  * window `y` offset (status bar + host header) and pass it as
@@ -1883,27 +1807,38 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
   const [targetProjectId, setTargetProjectId] = useState<string | null>(null);
   const { data } = todos;
 
-  const files = data ? [data.global, ...data.projects] : [];
+  const files = data ? [data.inbox, ...data.projects] : [];
   // The screen hides projects with no tasks; they stay in the composer's
   // target picker so the first add can still create their TODO.md.
   const visibleFiles = (data ? visibleTodoFiles(data) : []).filter(
-    (file) => filter === "all" || (file.projectId === null) === (filter === "global"),
+    (file) => filter === "all" || (file.projectId === null) === (filter === "inbox"),
   );
   const totalOpen = openCount(files);
   const totalItems = files.reduce((sum, file) => sum + file.items.length, 0);
   const filters: { id: FilterMode; label: string; count: number }[] = [
     { id: "all", label: "All", count: totalOpen },
-    { id: "global", label: "Global", count: data ? openCount([data.global]) : 0 },
+    { id: "inbox", label: "Inbox", count: data ? openCount([data.inbox]) : 0 },
     { id: "projects", label: "Projects", count: data ? openCount(data.projects) : 0 },
   ];
-  // Falls back to Global when the chosen project disappears.
-  const target = files.find((file) => file.projectId === targetProjectId) ?? GLOBAL_TARGET;
+  // Falls back to Inbox when the chosen project disappears.
+  const target = files.find((file) => file.projectId === targetProjectId) ?? INBOX_TARGET;
+  const gutter = layout.compact ? 16 : 28;
 
   return (
     <TodoDragSurface theme={theme} todos={todos}>
+      <TodoComposer
+        theme={theme}
+        compact={layout.compact}
+        gutter={gutter}
+        target={target}
+        targets={data ? files : [INBOX_TARGET]}
+        onSelectTarget={setTargetProjectId}
+        onAdd={todos.add}
+        error={todos.error}
+      />
       <ScrollView
         style={styles.fill}
-        contentContainerStyle={[styles.screenContent, { padding: layout.compact ? 16 : 28 }]}
+        contentContainerStyle={[styles.screenContent, { padding: gutter }]}
         keyboardShouldPersistTaps="handled"
       >
         <View style={styles.screenHeader}>
@@ -1964,7 +1899,7 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
           visibleFiles.length > 0 ? (
             visibleFiles.map((file) => (
               <TodoSection
-                key={file.projectId ?? "global"}
+                key={file.projectId ?? "inbox"}
                 file={file}
                 theme={theme}
                 todos={todos}
@@ -1974,35 +1909,25 @@ export function TodoScreen({ theme, layout, navigation }: PluginScreenProps) {
               />
             ))
           ) : (
-            <EmptyCard theme={theme} text="No lists yet — add a task below to create one." />
+            <EmptyCard theme={theme} text="No lists yet — add a task above to create one." />
           )
         ) : todos.error ? null : (
           <Text style={{ color: theme.colors.foregroundMuted }}>Loading…</Text>
         )}
       </ScrollView>
-
-      <TodoBottomComposer
-        theme={theme}
-        compact={layout.compact}
-        target={target}
-        targets={data ? files : [GLOBAL_TARGET]}
-        onSelectTarget={setTargetProjectId}
-        onAdd={todos.add}
-        error={todos.error}
-      />
     </TodoDragSurface>
   );
 }
 
-/** The Explorer list: the workspace's project, or the global list for a workspace rooted at `~`. */
+/** The Explorer list: the workspace's project, or the inbox list for a workspace rooted at `~`. */
 function workspaceFile(data: TodoListData, projectId: string, rootPath: string): TodoFile | null {
   const project = data.projects.find((file) => file.projectId === projectId);
   if (project) return project;
   // The server tags projects whose root resolves to `~`, symlinks included.
-  if (data.homeProjectIds.includes(projectId)) return data.global;
+  if (data.homeProjectIds.includes(projectId)) return data.inbox;
   // Fallback for a project the daemon no longer lists at all.
-  const homeDir = data.global.path.replace(/[\\/]TODO\.md$/, "");
-  return rootPath.replace(/[\\/]+$/, "") === homeDir ? data.global : null;
+  const homeDir = data.inbox.path.replace(/[\\/]TODO\.md$/, "");
+  return rootPath.replace(/[\\/]+$/, "") === homeDir ? data.inbox : null;
 }
 
 function resolveWorkspaceFile(
@@ -2284,6 +2209,14 @@ export function WorkspaceTodosPanel({
 
   return (
     <TodoDragSurface theme={theme} todos={todos}>
+      <TodoComposer
+        theme={theme}
+        compact
+        gutter={PANEL_GUTTER}
+        target={file}
+        onAdd={todos.add}
+        error={todos.error}
+      />
       <ScrollView
         style={styles.fill}
         contentContainerStyle={styles.panelContent}
@@ -2301,13 +2234,6 @@ export function WorkspaceTodosPanel({
           }
         />
       </ScrollView>
-      <TodoBottomComposer
-        theme={theme}
-        compact
-        target={file}
-        onAdd={todos.add}
-        error={todos.error}
-      />
     </TodoDragSurface>
   );
 }
@@ -2386,7 +2312,7 @@ const styles = StyleSheet.create({
     borderRadius: 999,
   },
   panelContent: {
-    padding: 12,
+    padding: PANEL_GUTTER,
   },
   panelMessage: {
     padding: 16,
@@ -2458,6 +2384,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 9,
     gap: 10,
+    userSelect: "none",
   },
   rowMain: {
     flex: 1,
@@ -2501,6 +2428,8 @@ const styles = StyleSheet.create({
     overflow: "hidden",
   },
   rowPanel: {
+    // Aligns the note under the title text.
+    paddingLeft: 40,
     paddingRight: 12,
     paddingBottom: 10,
   },
@@ -2517,6 +2446,7 @@ const styles = StyleSheet.create({
   },
   noteActions: {
     position: "absolute",
+    left: 46,
     right: 18,
     bottom: 16,
     flexDirection: "row",
@@ -2568,12 +2498,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  dragHandle: {
-    alignItems: "center",
-    justifyContent: "center",
-    marginLeft: -4,
-    paddingRight: 4,
-  },
   dragLifted: {
     opacity: 0.3,
   },
@@ -2588,10 +2512,15 @@ const styles = StyleSheet.create({
     height: 36,
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    borderWidth: 1,
+    // Aligns the ghost's text under the row's title text; the accent left
+    // edge echoes the drop line to mark it as the piece being dragged.
+    paddingLeft: 38,
+    paddingRight: 12,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderLeftWidth: 2,
+    opacity: 0.8,
+    userSelect: "none",
   },
   dragGhostText: {
     flex: 1,
@@ -2616,10 +2545,10 @@ const styles = StyleSheet.create({
     fontSize: 11.5,
     fontWeight: "500",
   },
-  bottomDock: {
-    borderTopWidth: StyleSheet.hairlineWidth,
+  composerDock: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
   },
-  bottomDockInner: {
+  composerDockInner: {
     width: "100%",
     maxWidth: 720,
     alignSelf: "center",
