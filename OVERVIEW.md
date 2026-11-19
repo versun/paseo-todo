@@ -1,11 +1,22 @@
-TODO keeps task lists in plain Markdown `TODO.md` files: one Inbox list in `~/TODO.md` and one per project in `<project root>/TODO.md`, on the daemon machine.
+TODO keeps task lists in plain Markdown `TODO.md` files on the daemon machine — an Inbox list in `~/TODO.md` plus one list per project in `<project root>/TODO.md`.
 
-The TODO screen (sidebar) shows Inbox and every project that has tasks, filtered by All, Inbox, or Projects, with overall progress. Add tasks from the field at the top; pick its target with the chips above it (Inbox by default, or any project — taskless projects stay selectable there, and their first add creates the list). The Explorer TODO tab shows the current workspace's project list with its add input, even when no `TODO.md` exists yet. When the current workspace's project has open tasks, a composer pill appears above the chat input; press it to check off open tasks or open the Explorer TODO tab. `/todo [task]` adds a task to the current workspace's project and opens that tab. Command Center has actions for both views.
+## Where tasks show up
 
-Items are Markdown checkboxes (`- [ ] task`). Press the checkbox to check it off, press the task text to edit it in place, and use × to delete it. Completed tasks are collapsed under each list. Views refresh every couple of seconds.
+- **TODO screen** — every list in one place, filterable by All / Inbox / Projects with open counts, a done summary, and a progress bar. The field at the top adds a task to the target picked in the chips above it (Inbox by default; taskless projects stay selectable, and the first add creates their file). The sidebar item shows the total open count.
+- **Explorer TODO tab** — the current workspace's project list with its own add field, even before `TODO.md` exists. A workspace rooted at `~` gets the Inbox list; one rooted at `~/.paseo` has none.
+- **Composer pill** — `TODO · N` appears above the chat input while the workspace's project has open tasks; press it to work those tasks or open the Explorer tab.
+- **`/todo [task]`** — adds a task to the workspace's project list and opens the Explorer tab (no argument just opens it).
+- **Command Center** — "Open TODO" and "Open workspace TODO" actions.
 
-Long-press a row and move to drag it: drop it elsewhere in its list to reorder the task, or drop it onto another project's list to move it there (the TODO screen shows every list; the Explorer tab reorders within its own). The moved task keeps its checked state and note. Dropping near a row's top or bottom edge inserts before or after it; dropping elsewhere on a list appends at the end.
+## Working with tasks
 
-Indented non-checkbox lines directly under a task are its note: press a task to expand its details panel and edit the note there. Notes are stored as plain text in the same `TODO.md` — note edits rewrite those indented lines, and deleting the task deletes them too. Inside a workspace, the details panel also has a **Link workspace** action on the bottom-left (stored as `[name](paseo:workspace:<id>)` at the top of the note block); bound tasks show their workspace link and jump to that workspace when pressed.
+- Press the circle to check a task off, the text to edit it in place (Enter or clicking away saves, Esc cancels).
+- Press the pencil to open the details panel: edit the note, **Link workspace**, or **Delete** the task.
+- **Link workspace** binds the task to the current workspace; bound tasks show a chip that jumps straight back to it, marked archived once the workspace is gone.
+- Long-press a row and drag: drop between rows to reorder, or onto another list to move the task there — it keeps its checked state and note.
+- Completed tasks collapse under each list. Views refresh every couple of seconds.
 
-A `TODO.md` file is created on the first add; checking off, editing, and deleting never create one. Edits keep the file's other lines and line endings intact. If a task changed on disk since the view last refreshed, checking it off, editing it, or deleting it is refused so the wrong task is never changed. The plugin reads and writes only these files. A workspace rooted at `~` uses the Inbox list; projects rooted at `~/.paseo` have no list.
+## On disk
+
+- Tasks are `- [ ]` checkboxes; indented lines under a task are its note. A bound workspace is stored as `[name](paseo:workspace:<id>)` at the top of the note and renders as a chip that opens it (shown as archived once the workspace is gone).
+- `TODO.md` is created only by adding a task. Edits preserve the rest of the file and its line endings, and are refused if the file changed on disk since the view refreshed — the wrong task is never touched.

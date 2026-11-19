@@ -1,20 +1,22 @@
 # paseo-todo
 
-A [Paseo](https://paseo.sh) plugin that keeps task lists in plain Markdown
-`TODO.md` files and surfaces them in the app — one global list (`~/TODO.md`)
-and one per project (`<project root>/TODO.md`).
+**English** | [中文](README.zh-CN.md)
 
-See [OVERVIEW.md](OVERVIEW.md) for the full feature description.
+A [Paseo](https://paseo.sh) plugin that keeps task lists in plain Markdown
+`TODO.md` files — one Inbox (`~/TODO.md`) and one per project
+(`<project root>/TODO.md`) — and surfaces them throughout the app.
+
+See [OVERVIEW.md](OVERVIEW.md) for the full feature tour.
 
 ## Features
 
-- TODO screen aggregating all lists (Inbox / per-project), with progress
-- Explorer TODO tab for the current workspace
-- Composer pill that appears when the workspace's project has open tasks:
-  shows the count, lets you check them off, and opens the Explorer tab
-- `/todo [task]` slash command and Command Center actions
-- Markdown checkboxes (`- [ ] task`): check, inline edit, delete — edits
-  preserve the rest of the file and its line endings
+- TODO screen aggregating every list, with filters and progress
+- Explorer TODO tab for the current workspace's project
+- Composer pill above the chat input while the project has open tasks
+- `/todo` slash command and Command Center actions
+- Check off, inline-edit, notes, and drag to reorder or move tasks
+  between lists
+- Bind a task to a workspace and jump back to it anytime
 
 ## Development
 
